@@ -118,6 +118,11 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE TABLE IF NOT EXISTS repos (
+    path      TEXT PRIMARY KEY,
+    last_seen TEXT
+);
 """
 
 
@@ -260,9 +265,30 @@ def author_matches(name: str, email: str, needles: list[str]) -> bool:
     return any(n in hay for n in needles)
 
 
-def scan_git(db: sqlite3.Connection, roots: list[Path], authors: list[str]) -> tuple[int, list[str]]:
-    needles = [a.strip().lower() for a in authors if a.strip()]
+def cached_repos(db: sqlite3.Connection, roots: list[Path],
+                 rediscover: bool = False) -> list[Path]:
+    """Repo discovery with a persistent cache — walking iCloud-backed trees
+    (~/Desktop) is minutes-slow, so rescans reuse the last discovered list.
+    Pass --rediscover (or empty cache) to walk again."""
+    if not rediscover:
+        cached = [Path(r[0]) for r in db.execute("SELECT path FROM repos")]
+        cached = [p for p in cached if (p / ".git").exists()]
+        if cached:
+            return cached
     repos = find_git_repos(roots)
+    now = datetime.now().astimezone().isoformat(timespec="seconds")
+    for r in repos:
+        db.execute("INSERT INTO repos(path,last_seen) VALUES(?,?) "
+                   "ON CONFLICT(path) DO UPDATE SET last_seen=excluded.last_seen",
+                   (str(r), now))
+    db.commit()
+    return repos
+
+
+def scan_git(db: sqlite3.Connection, roots: list[Path], authors: list[str],
+             rediscover: bool = False, timeout: int = GIT_TIMEOUT_S) -> tuple[int, list[str]]:
+    needles = [a.strip().lower() for a in authors if a.strip()]
+    repos = cached_repos(db, roots, rediscover)
     say(f"  git: {len(repos)} repos under {', '.join(str(r) for r in roots if r.is_dir())}")
     added, notes = 0, []
     fmt = "%x1e%H%x1f%an%x1f%ae%x1f%aI"
@@ -271,7 +297,7 @@ def scan_git(db: sqlite3.Connection, roots: list[Path], authors: list[str]) -> t
             out = subprocess.run(
                 ["git", "-C", str(repo), "log", "--all", "--no-merges",
                  "--numstat", f"--pretty=format:{fmt}"],
-                capture_output=True, text=True, timeout=GIT_TIMEOUT_S, errors="replace")
+                capture_output=True, text=True, timeout=timeout, errors="replace")
         except subprocess.TimeoutExpired:
             notes.append(f"timeout: {repo}")
             warn(f"git timeout (iCloud?): {repo}")
@@ -308,6 +334,7 @@ def scan_git(db: sqlite3.Connection, roots: list[Path], authors: list[str]) -> t
                             loc_add=add, loc_del=dele, items=1,
                             meta={"files": files, "email": ae}):
                 added += 1
+        db.commit()  # per-repo durability: interrupted scans lose nothing
     return added, notes
 
 
@@ -347,6 +374,7 @@ def scan_session_jsonl(db: sqlite3.Connection, path: Path, source: str,
                   ts_start=stamps[0], ts_end=stamps[-1], project=project,
                   items=msgs, meta={"active_s": active_s, "days": days,
                                     "tools": tools, "file": str(path)})
+    db.commit()  # per-file durability: interrupted scans lose nothing
     return True
 
 
@@ -447,9 +475,23 @@ AIDER_TS_RE = re.compile(r"^#### (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 def scan_aider(db: sqlite3.Connection, roots: list[Path]) -> tuple[int, list[str]]:
     added = 0
     files: list[Path] = []
-    for root in roots:
-        if root.is_dir():
-            files.extend(root.rglob(".aider.chat.history.md"))
+    # aider writes its history at the repo root — check known repos (fast),
+    # only fall back to a pruned walk when no repo cache exists yet
+    known = [Path(r[0]) for r in db.execute("SELECT path FROM repos")]
+    if known:
+        files = [p / ".aider.chat.history.md" for p in known
+                 if (p / ".aider.chat.history.md").is_file()]
+    else:
+        for root in roots:
+            if not root.is_dir():
+                continue
+            for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+                dirnames[:] = [d for d in dirnames
+                               if d not in SKIP_DIR_NAMES and not d.startswith("~$")]
+                if len(Path(dirpath).relative_to(root).parts) >= 4:
+                    dirnames[:] = []
+                if ".aider.chat.history.md" in filenames:
+                    files.append(Path(dirpath) / ".aider.chat.history.md")
     say(f"  aider: {len(files)} history files")
     for f in files:
         if file_unchanged(db, f):
@@ -740,7 +782,8 @@ def cmd_scan(args) -> None:
             continue
         t = time.time()
         if s == "git":
-            added, notes = scan_git(db, roots, authors)
+            added, notes = scan_git(db, roots, authors, rediscover=args.rediscover,
+                                    timeout=args.git_timeout)
             local_repo_names = {r[0].lower() for r in db.execute(
                 "SELECT DISTINCT project FROM events WHERE source='git'") if r[0]}
         elif s == "claude":
@@ -1091,6 +1134,10 @@ def main() -> None:
     p.add_argument("--roots", help="comma list of dirs to search for repos")
     p.add_argument("--gh-owners", help="github owners/orgs for the github source")
     p.add_argument("--gh-login", help="your github login for attribution")
+    p.add_argument("--rediscover", action="store_true",
+                   help="re-walk roots for repos instead of using the cached list")
+    p.add_argument("--git-timeout", type=int, default=GIT_TIMEOUT_S,
+                   help="per-repo git log timeout in seconds (bump for cold iCloud repos)")
     p.set_defaults(fn=cmd_scan)
 
     p = sub.add_parser("status", help="quick terminal summary")
