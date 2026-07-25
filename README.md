@@ -1,117 +1,174 @@
-# coding-ledger
+# Coding Ledger
 
-**Local forensic scanner for your entire coding history. Zero dependencies.**
+Coding Ledger is a local-first, evidence-backed record of coding work. It combines
+Git history, coding-agent sessions, editor receipts, and optional GitHub statistics
+without storing prompt bodies, source code, secrets, or tool output in its database.
 
-One Python file, stdlib only (3.10+). No pip installs, no SaaS, no 30-day API
-windows. It walks the filesystem, materializes every receipt into a permanent
-SQLite ledger, and renders a fully offline HTML dashboard.
+It is a single Python 3.10+ standard-library application. The generated dashboard is
+self-contained and works offline.
 
-| Source | What it pulls | Path / method |
-|--------|---------------|---------------|
-| **Git** | Every commit: LOC + timestamps, author-filtered, deduped by SHA across clones/worktrees | `git log --all --numstat` across local repos under `~/Projects`, `~/Desktop`, `~/dev` |
-| **Claude Code** | Sessions: wall time (idle-gap sessionized), messages, tool calls | `~/.claude/projects/**/*.jsonl` |
-| **Cursor** | Agent transcripts, chat store.db, local history | `~/.cursor/projects/*/agent-transcripts/*.jsonl`, `~/.cursor/chats/**/store.db`, `~/Library/Application Support/Cursor/User/History` |
-| **Aider** | Chat history timestamps | `**/.aider.chat.history.md` |
-| **VS Code Local History** | File edit entries (activity proxy, capped) | `~/Library/Application Support/Code/User/History` |
-| **GitHub** | Weekly LOC + commits for repos NOT cloned locally (via `gh`) | `repos/{owner}/{repo}/stats/contributors` |
+## Sources
 
-Everything lands in `~/.coding-ledger/ledger.db`. Raw events are kept forever;
-hours are recomputed from raw data on every report, so you can retune the
-heuristics anytime without rescanning.
+| Source | Receipt | Hours |
+|---|---|---:|
+| Git | Author-filtered commits, SHA, timestamp, numstat, co-author trailers | Daily density proxy |
+| Claude Code | `~/.claude/projects/**/*.jsonl` metadata | Sessionized active time |
+| Codex | `~/.codex/sessions/**/*.jsonl` metadata | Sessionized and attributed time |
+| Cursor | Agent transcripts, chat timestamps, local history | Sessionized active time |
+| Aider | `.aider.chat.history.md` timestamps | Sessionized active time |
+| VS Code | Local History edit timestamps | Capped edit proxy |
+| GitHub | Contributor-week commits and LOC for remote-only repositories | Zero hours |
 
-Perfect for:
-
-- Proving **10,000 hours** (journeyman badge)
-- AI-vs-human attribution
-- Sovereign, offline stats no SaaS can revoke
-
-Built for the ExecLayer / SovereignClaw mindset: *receipts over assurances*.
+Git commits are deduplicated by SHA. Growing agent sessions are replaced by stable,
+path-based event IDs, making rescans idempotent.
 
 ## Quick start
 
 ```bash
-python3 coding_ledger.py init --author "Your Name,you@email.com"
+python3 coding_ledger.py init \
+  --author "James Benton,kjscusoms831@gmail.com,jamesbenton@ymail.com"
 
-# full multi-source backfill (idempotent — rerun anytime)
-python3 coding_ledger.py scan
-
-# or selective
-python3 coding_ledger.py scan --sources git,claude
-python3 coding_ledger.py scan --sources github --gh-owners you,YourOrg
+python3 coding_ledger.py scan \
+  --roots "$HOME/Projects,$HOME/dev,$HOME/Documents/Codex,/Volumes/MacBook Extended Storage/Coding-Ledger-GitHub"
 
 python3 coding_ledger.py status
 python3 coding_ledger.py report --format markdown
-python3 coding_ledger.py report --format json
 python3 coding_ledger.py dashboard --open
-python3 coding_ledger.py doctor            # which sources exist on this box
 ```
 
-Default DB: `~/.coding-ledger/ledger.db` (`--db` or `$CODING_LEDGER_DB` to
-override). Default dashboard: `~/.coding-ledger/dashboard.html`.
+Do not include iCloud-backed Desktop repositories in scan roots. Explicit roots are
+enforced even when the database contains older cached Desktop paths.
 
-## Dashboard
+## Lightweight GitHub history
 
-Self-contained dark HTML. Chart.js is **vendored and inlined** (see
-`vendor/`), so the dashboard works fully offline with no CDN calls (falls back
-to an SRI-pinned CDN tag only if the vendored file is missing).
-
-- Progress to 10k hours + remaining
-- Stacked daily hours by source (last 180 days) + all-time monthly
-- Doughnut source breakdown
-- Cumulative hours curve toward 10k
-- Daily LOC added (log scale)
-- Top projects table (hours, +LOC, -LOC)
-
-## Hours heuristics (yours to tune, constants at top of file)
-
-- **Claude / Cursor / Aider**: real wall-clock from timestamps, sessionized at
-  30-minute idle gaps, split across midnights per local day
-- **Git**: density credit per active day: `0.35h + 0.10h x commits`, capped at
-  6h/day, distributed to projects by commit share
-- **VS Code Local History**: 2 min per edit, capped at 90 min/day
-- **GitHub**: LOC/commits only, **zero hours** (no double counting), and repos
-  already scanned locally are skipped entirely
-
-All raw data is retained forever; recompute anytime.
-
-## Scan design
-
-- **Idempotent**: every event has a dedup `uid` (`git:<sha>`,
-  `claude:<session-path>`, ...). Rescans only add what's new.
-- **Incremental**: unchanged files (mtime+size cache) are skipped; growing
-  session files are re-parsed and upserted.
-- **Clone-proof**: commits dedup by SHA, so clones, worktrees, and
-  `-main-merge` copies never double count.
-- **Hang-proof**: per-repo `git log` gets a 60s timeout (iCloud dataless
-  placeholder folders on `~/Desktop` love to hang git — those repos get
-  skipped with a note instead of stalling the scan).
-
-## Background daemon (macOS)
+Working trees are unnecessary for exact Git history. Create or update no-checkout
+repositories on non-iCloud storage:
 
 ```bash
-python3 coding_ledger.py install-daemon --hour 21   # daily scan at 21:00
-python3 coding_ledger.py uninstall-daemon
+python3 coding_ledger.py sync-github \
+  --owners "BMC-INC" \
+  --destination "/Volumes/MacBook Extended Storage/Coding-Ledger-GitHub"
 ```
 
-Caveat: launchd calendar jobs don't fire while the Mac sleeps.
+These repositories contain Git objects and refs but omit working-tree build artifacts
+such as `node_modules` and Rust `target`. Add the destination to `--roots`; the normal
+Git scanner then records exact commit SHAs and numstat.
 
-## Why this works for full history
+The GitHub aggregate source remains a fallback for repositories not represented by
+a local or no-checkout repository:
 
-Git, Claude Code, Cursor, Aider, and VS Code Local History all leave permanent
-local receipts. The GitHub source backfills repos that only exist remotely.
-Your scanner just walks the filesystem and materializes the truth into one
-queryable SQLite file.
+```bash
+python3 coding_ledger.py scan \
+  --sources github \
+  --gh-owners "BMC-INC" \
+  --gh-login "YOUR_GITHUB_LOGIN"
+```
 
-## Future
+GitHub aggregates receive zero hours and are skipped for projects already represented
+by exact local Git receipts.
 
-- Deeper Cursor `state.vscdb` / `bubbleId` token extraction
-- Wakatime / other importers
-- Rust port for single-binary ultra-light daemon
+## Hours and attribution
 
-## License
+Coding Ledger reports two totals:
 
-MIT. Your data never leaves the box.
+- **Raw source sum** preserves every source's independent hours.
+- **Attributed total** conservatively discounts overlap between agent sessions and
+  human Git/editor proxies.
 
----
+The attributed total is divided into:
 
-*Built for King / ExecLayer — the only hours that count are the ones you can prove yourself.*
+- **Own:** Git and VS Code activity outside measured agent overlap.
+- **Co-authored:** agent activity within ten minutes of an explicit human steering
+  turn. Explicit Git `Co-authored-by` trailers are retained as supporting evidence.
+- **AI-only:** assistant and tool activity outside the steering window, or automated
+  sessions with no human turn.
+
+These are evidence-based estimates, not claims about who typed each line. The JSON
+report exposes the raw totals, attributed totals, source breakdown, and underlying
+badge metrics.
+
+Current time heuristics:
+
+- Agent sources: timestamps split at 30-minute idle gaps with a one-minute floor.
+- Git: `0.35h + 0.10h × commits` per active day, capped at six hours.
+- VS Code: two minutes per history edit, capped at 90 minutes per day.
+- GitHub: commits and LOC only; zero hours.
+
+## Builder profile and badges
+
+The dashboard is an offline builder field report with five reproducible dimensions:
+
+- Steering
+- Planning
+- Engineering
+- Execution
+- Autonomy
+
+The highest dimension selects an archetype such as The Architect, The Director,
+The Quality Guardian, The Shipping Engine, or The Agent Orchestrator.
+
+Badges have visible Bronze, Silver, Gold, and Platinum thresholds:
+
+- Commit Cadence
+- Quality Loop
+- Steering Hand
+- Toolsmith
+- Parallel Commander
+- Night Shift
+- AI Pairing
+
+Every badge shows its measured value and next threshold. No model-generated personality
+judgment is stored or required.
+
+## Privacy
+
+For agent sessions, Coding Ledger reads only:
+
+- timestamps and record types
+- session identifier and working directory
+- role counts
+- tool-call counts
+- locally derived test, planning, and parallel-agent counts
+
+It does **not** store:
+
+- prompts or assistant responses
+- reasoning text
+- tool arguments or output
+- source code
+- environment variables, credentials, or API keys
+
+The database stores minimal provenance: source path, project identifier, day buckets,
+active seconds, attribution seconds, and aggregate counts.
+
+## Scan durability
+
+A scan row is written before processing starts. It is updated after every source and
+ends as `running`, `complete`, or `interrupted`.
+
+`status` explicitly labels the ledger provisional when no completed scan exists.
+Per-repository and per-session commits preserve already imported events after an
+interruption. Git timeouts are recorded with exact repository paths.
+
+Use `scan --sources claude,codex --reprocess-sessions` after changing attribution
+rules; it invalidates only the selected source caches and upserts the same stable events.
+
+## Commands
+
+```text
+init              Initialize metadata and author identities
+scan              Scan selected sources and explicit roots
+status            Show terminal totals, attribution, and scan state
+report            Produce Markdown or JSON
+dashboard         Generate the offline HTML field report
+doctor            Show discoverable sources, including Codex
+sync-github       Maintain lightweight no-checkout GitHub history
+install-daemon    Install the macOS daily scan
+uninstall-daemon  Remove the daily scan
+```
+
+Run tests with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```

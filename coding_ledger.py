@@ -12,6 +12,7 @@ Sources:
   cursor   Cursor agent transcripts / chat DBs / local history
   aider    .aider.chat.history.md files
   vscode   VS Code Local History (edit-level activity proxy)
+  codex    Codex sessions (~/.codex/sessions/**/*.jsonl), metadata only
   github   remote repos via `gh` (weekly LOC for repos not cloned locally)
 
 Usage:
@@ -31,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import html
 import json
 import os
 import re
@@ -48,10 +50,11 @@ LEDGER_DIR = Path(os.environ.get("CODING_LEDGER_DIR", HOME / ".coding-ledger"))
 DEFAULT_DB = Path(os.environ.get("CODING_LEDGER_DB", LEDGER_DIR / "ledger.db"))
 DASHBOARD_PATH = LEDGER_DIR / "dashboard.html"
 
-ALL_SOURCES = ["git", "claude", "cursor", "aider", "vscode", "github"]
-DEFAULT_ROOTS = [HOME / "Projects", HOME / "Desktop", HOME / "dev"]
+ALL_SOURCES = ["git", "claude", "codex", "cursor", "aider", "vscode", "github"]
+DEFAULT_ROOTS = [HOME / "Projects", HOME / "dev", HOME / "Documents" / "Codex"]
 
 IDLE_GAP_S = 30 * 60          # gap that splits a session
+STEERING_WINDOW_S = 10 * 60   # agent work within this window is human/AI co-authored
 MIN_SESSION_S = 60            # floor credit per sub-session
 GIT_BASE_H = 0.35             # density credit: base hours per active git day
 GIT_PER_COMMIT_H = 0.10       # + per commit that day
@@ -111,7 +114,8 @@ CREATE TABLE IF NOT EXISTS scans (
     finished_at TEXT,
     sources     TEXT,
     added       INTEGER,
-    notes       TEXT
+    notes       TEXT,
+    status      TEXT DEFAULT 'complete'
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -131,6 +135,11 @@ def open_db(path: Path) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    scan_cols = {r[1] for r in db.execute("PRAGMA table_info(scans)")}
+    if "status" not in scan_cols:
+        db.execute("ALTER TABLE scans ADD COLUMN status TEXT DEFAULT 'complete'")
+    db.execute("UPDATE scans SET status='complete' WHERE status IS NULL")
+    db.commit()
     return db
 
 
@@ -232,6 +241,48 @@ def sessions_from_timestamps(stamps: list[datetime]) -> tuple[int, dict[str, int
     return total, days
 
 
+def sessions_from_activity(
+        activity: list[tuple[datetime, str]]) -> tuple[int, dict[str, int], dict[str, int]]:
+    """Sessionize timestamped activity and conservatively attribute active seconds.
+
+    `user` activity opens a steering window. Assistant/tool activity inside that
+    window is co-authored; later autonomous activity is AI-only. Human-only
+    activity is accounted for separately from Git and editor receipts.
+    """
+    if not activity:
+        return 0, {}, {"coauthored_s": 0, "ai_only_s": 0}
+    ordered = sorted(activity, key=lambda item: item[0])
+    active_s, days = sessions_from_timestamps([ts for ts, _ in ordered])
+    coauthored = ai_only = 0
+    last_user: datetime | None = None
+    previous: datetime | None = None
+    for ts, kind in ordered:
+        if previous is None or (ts - previous).total_seconds() > IDLE_GAP_S:
+            previous = ts
+            last_user = ts if kind == "user" else None
+            continue
+        segment = max(0, int((ts - previous).total_seconds()))
+        if last_user:
+            window_end = last_user + timedelta(seconds=STEERING_WINDOW_S)
+            steered_end = min(ts, window_end)
+            steered = max(0, int((steered_end - previous).total_seconds()))
+            coauthored += min(steered, segment)
+            ai_only += max(segment - steered, 0)
+        else:
+            ai_only += segment
+        if kind == "user":
+            last_user = ts
+        previous = ts
+    credited = coauthored + ai_only
+    if credited < active_s:
+        # The minimum per-session credit follows the strongest available signal.
+        if any(kind == "user" for _, kind in ordered):
+            coauthored += active_s - credited
+        else:
+            ai_only += active_s - credited
+    return active_s, days, {"coauthored_s": coauthored, "ai_only_s": ai_only}
+
+
 # ---------------------------------------------------------------- git scanner
 
 def find_git_repos(roots: list[Path]) -> list[Path]:
@@ -260,6 +311,20 @@ def find_git_repos(roots: list[Path]) -> list[Path]:
     return repos
 
 
+def path_under_roots(path: Path, roots: list[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    for root in roots:
+        try:
+            resolved.relative_to(root.resolve())
+            return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
 def author_matches(name: str, email: str, needles: list[str]) -> bool:
     hay = f"{name} <{email}>".lower()
     return any(n in hay for n in needles)
@@ -272,11 +337,13 @@ def cached_repos(db: sqlite3.Connection, roots: list[Path],
     Pass --rediscover (or empty cache) to walk again."""
     if not rediscover:
         cached = [Path(r[0]) for r in db.execute("SELECT path FROM repos")]
-        cached = [p for p in cached if (p / ".git").exists()]
+        cached = [p for p in cached if path_under_roots(p, roots) and (p / ".git").exists()]
         if cached:
             return cached
     repos = find_git_repos(roots)
     now = datetime.now().astimezone().isoformat(timespec="seconds")
+    # Cache entries outside the current roots remain as forensic history but can
+    # never leak back into a scan that explicitly excludes those roots.
     for r in repos:
         db.execute("INSERT INTO repos(path,last_seen) VALUES(?,?) "
                    "ON CONFLICT(path) DO UPDATE SET last_seen=excluded.last_seen",
@@ -291,7 +358,8 @@ def scan_git(db: sqlite3.Connection, roots: list[Path], authors: list[str],
     repos = cached_repos(db, roots, rediscover)
     say(f"  git: {len(repos)} repos under {', '.join(str(r) for r in roots if r.is_dir())}")
     added, notes = 0, []
-    fmt = "%x1e%H%x1f%an%x1f%ae%x1f%aI"
+    fmt = ("%x1e%H%x1f%an%x1f%ae%x1f%aI%x1f"
+           "%(trailers:key=Co-authored-by,valueonly,separator=%x1d)")
     for repo in repos:
         try:
             out = subprocess.run(
@@ -312,9 +380,9 @@ def scan_git(db: sqlite3.Connection, roots: list[Path], authors: list[str],
                 continue
             head, _, body = record.partition("\n")
             parts = head.split("\x1f")
-            if len(parts) != 4:
+            if len(parts) != 5:
                 continue
-            sha, an, ae, aiso = parts
+            sha, an, ae, aiso, coauthor_text = parts
             if needles and not author_matches(an, ae, needles):
                 continue
             ts = parse_iso(aiso)
@@ -330,9 +398,16 @@ def scan_git(db: sqlite3.Connection, roots: list[Path], authors: list[str],
                     if d.isdigit():
                         dele += int(d)
                     files += 1
+            coauthors = [value.strip() for value in coauthor_text.split("\x1d")
+                         if value.strip()]
+            ai_coauthor = any(any(token in value.lower() for token in (
+                "claude", "codex", "cursor", "copilot", "bot@", "[bot]"))
+                              for value in coauthors)
             if insert_event(db, f"git:{sha}", "git", "commit", ts, None, repo_name,
                             loc_add=add, loc_del=dele, items=1,
-                            meta={"files": files, "email": ae}):
+                            meta={"files": files, "email": ae,
+                                  "coauthor_count": len(coauthors),
+                                  "ai_coauthor": ai_coauthor}):
                 added += 1
         db.commit()  # per-repo durability: interrupted scans lose nothing
     return added, notes
@@ -350,30 +425,47 @@ def scan_session_jsonl(db: sqlite3.Connection, path: Path, source: str,
     uid = uid or f"{source}:{path.stem}"
     if file_unchanged(db, path):
         return False
-    stamps: list[datetime] = []
-    msgs = tools = 0
+    activity: list[tuple[datetime, str]] = []
+    msgs = tools = users = tests = parallel = 0
     try:
         with open(path, "r", errors="replace") as fh:
             for line in fh:
                 m = TS_RE.search(line[:2000])
+                ts = None
                 if m:
                     ts = parse_iso(m.group(1))
-                    if ts:
-                        stamps.append(ts)
-                if '"type":"assistant"' in line[:200] or '"type": "assistant"' in line[:200]:
+                prefix = line[:4000]
+                kind = "assistant"
+                if ('"role":"user"' in prefix or '"role": "user"' in prefix or
+                        '"type":"user"' in prefix or '"type": "user"' in prefix):
+                    kind = "user"
+                    users += 1
+                elif ('"tool_use"' in prefix or '"function_call"' in prefix):
+                    kind = "tool"
+                if ts:
+                    activity.append((ts, kind))
+                if '"type":"assistant"' in prefix or '"type": "assistant"' in prefix:
                     msgs += 1
-                tools += line.count('"type":"tool_use"')
+                tools += prefix.count('"type":"tool_use"') + prefix.count('"function_call"')
+                lowered = prefix.lower()
+                if any(token in lowered for token in ("cargo test", "pytest", "npm test",
+                                                       "pnpm test", "unittest", "go test")):
+                    tests += 1
+                if "spawn_agent" in lowered or "create_thread" in lowered:
+                    parallel += 1
     except OSError:
         return False
     file_mark(db, path)
-    if not stamps:
+    if not activity:
         return False
-    active_s, days = sessions_from_timestamps(stamps)
-    stamps.sort()
+    active_s, days, attribution = sessions_from_activity(activity)
+    stamps = sorted(ts for ts, _ in activity)
     replace_event(db, uid, source=source, kind="session",
                   ts_start=stamps[0], ts_end=stamps[-1], project=project,
                   items=msgs, meta={"active_s": active_s, "days": days,
-                                    "tools": tools, "file": str(path)})
+                                    **attribution, "tools": tools,
+                                    "user_messages": users, "test_calls": tests,
+                                    "parallel_calls": parallel, "file": str(path)})
     db.commit()  # per-file durability: interrupted scans lose nothing
     return True
 
@@ -399,6 +491,121 @@ def scan_claude(db: sqlite3.Connection) -> tuple[int, list[str]]:
         if scan_session_jsonl(db, f, "claude", project_from_claude_dir(rel.parts[0]),
                               uid=f"claude:{rel}"):
             added += 1
+    return added, []
+
+
+def project_from_path(cwd: str | None, fallback: str = "misc") -> str:
+    if not cwd:
+        return fallback
+    path = Path(cwd)
+    ignored = {"worktrees", ".git", "tmp", "private", "var"}
+    parts = [part for part in path.parts if part not in ignored]
+    for anchor in ("Projects", "Desktop", "dev", "Codex"):
+        if anchor in parts:
+            idx = parts.index(anchor)
+            if idx + 1 < len(parts):
+                candidate_idx = idx + 1
+                if (anchor == "Codex" and
+                        re.fullmatch(r"\d{4}-\d{2}-\d{2}", parts[candidate_idx]) and
+                        candidate_idx + 1 < len(parts)):
+                    candidate_idx += 1
+                return parts[candidate_idx]
+    return path.name or fallback
+
+
+def parse_codex_session(path: Path) -> dict | None:
+    """Read only timing/type metadata from a Codex JSONL session."""
+    activity: list[tuple[datetime, str]] = []
+    project = path.stem
+    session_id = path.stem
+    tools = users = assistants = tests = parallel = plan_turns = turns = 0
+    try:
+        with path.open("r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = parse_iso(row.get("timestamp", ""))
+                payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+                row_type = row.get("type")
+                payload_type = payload.get("type")
+                kind: str | None = None
+                if row_type == "session_meta":
+                    project = project_from_path(payload.get("cwd"), project)
+                    session_id = str(payload.get("id") or session_id)
+                elif row_type == "turn_context":
+                    turns += 1
+                    mode = payload.get("collaboration_mode")
+                    mode_text = json.dumps(mode, separators=(",", ":")).lower()
+                    if "plan" in mode_text:
+                        plan_turns += 1
+                elif row_type == "event_msg" and payload_type == "user_message":
+                    kind = "user"
+                    users += 1
+                elif row_type == "response_item":
+                    if payload_type == "function_call":
+                        kind = "tool"
+                        tools += 1
+                        name = str(payload.get("name") or "").lower()
+                        arguments = str(payload.get("arguments") or "").lower()
+                        if any(token in arguments for token in (
+                                "cargo test", "pytest", "npm test", "pnpm test",
+                                "unittest", "go test", "swift test")):
+                            tests += 1
+                        if "spawn_agent" in name or "create_thread" in name:
+                            parallel += 1
+                    elif payload_type == "message" and payload.get("role") == "user":
+                        # System/developer context is represented as user-role messages;
+                        # the explicit event_msg is the reliable human-turn receipt.
+                        continue
+                    elif payload_type in {"message", "reasoning"}:
+                        kind = "assistant"
+                        assistants += 1
+                elif row_type == "event_msg" and payload_type == "agent_message":
+                    # response_item carries the same message; avoid double counting.
+                    continue
+                if ts and kind:
+                    activity.append((ts, kind))
+    except OSError:
+        return None
+    if not activity:
+        return None
+    active_s, days, attribution = sessions_from_activity(activity)
+    stamps = [ts for ts, _ in activity]
+    return {
+        "session_id": session_id, "project": project, "ts_start": min(stamps),
+        "ts_end": max(stamps), "active_s": active_s, "days": days,
+        **attribution, "items": assistants, "tools": tools,
+        "user_messages": users, "test_calls": tests, "parallel_calls": parallel,
+        "plan_turns": plan_turns, "turns": turns,
+    }
+
+
+def scan_codex(db: sqlite3.Connection) -> tuple[int, list[str]]:
+    root = HOME / ".codex" / "sessions"
+    if not root.is_dir():
+        return 0, ["no ~/.codex/sessions"]
+    files = sorted(root.rglob("*.jsonl"))
+    say(f"  codex: {len(files)} session files")
+    added = 0
+    for path in files:
+        if file_unchanged(db, path):
+            continue
+        parsed = parse_codex_session(path)
+        file_mark(db, path)
+        if not parsed:
+            continue
+        rel = path.relative_to(root)
+        replace_event(
+            db, f"codex:{rel}", source="codex", kind="session",
+            ts_start=parsed["ts_start"], ts_end=parsed["ts_end"],
+            project=parsed["project"], items=parsed["items"],
+            meta={k: v for k, v in parsed.items()
+                  if k not in {"session_id", "project", "ts_start", "ts_end", "items"}}
+                  | {"session_id": parsed["session_id"], "file": str(path)})
+        db.commit()
+        added += 1
     return added, []
 
 
@@ -477,7 +684,8 @@ def scan_aider(db: sqlite3.Connection, roots: list[Path]) -> tuple[int, list[str
     files: list[Path] = []
     # aider writes its history at the repo root — check known repos (fast),
     # only fall back to a pruned walk when no repo cache exists yet
-    known = [Path(r[0]) for r in db.execute("SELECT path FROM repos")]
+    known = [Path(r[0]) for r in db.execute("SELECT path FROM repos")
+             if path_under_roots(Path(r[0]), roots)]
     if known:
         files = [p / ".aider.chat.history.md" for p in known
                  if (p / ".aider.chat.history.md").is_file()]
@@ -609,6 +817,49 @@ def scan_github(db: sqlite3.Connection, owners: list[str], login: str,
     return added, notes
 
 
+def cmd_sync_github(args) -> None:
+    """Create/update lightweight no-checkout repositories for exact Git history."""
+    destination = Path(args.destination).expanduser().resolve()
+    owners = [owner.strip() for owner in args.owners.split(",") if owner.strip()]
+    if not owners:
+        raise SystemExit("--owners must contain at least one GitHub owner")
+    destination.mkdir(parents=True, exist_ok=True)
+    failures = []
+    synced = 0
+    for owner in owners:
+        rc, out = _gh(["repo", "list", owner, "--limit", str(args.limit),
+                       "--json", "name,nameWithOwner,isFork,isArchived"])
+        if rc:
+            failures.append(f"unable to list {owner}")
+            continue
+        repos = [r for r in json.loads(out or "[]")
+                 if not r.get("isFork") and (args.include_archived or not r.get("isArchived"))]
+        say(f"  {owner}: {len(repos)} repositories")
+        for repo in repos:
+            full = repo["nameWithOwner"]
+            target = destination / owner / repo["name"]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if (target / ".git").is_dir():
+                run = subprocess.run(["git", "-C", str(target), "fetch", "--all", "--prune"],
+                                     capture_output=True, text=True)
+            elif target.exists():
+                failures.append(f"destination exists but is not a Git repo: {target}")
+                continue
+            else:
+                run = subprocess.run(
+                    ["gh", "repo", "clone", full, str(target), "--", "--no-checkout"],
+                    capture_output=True, text=True)
+            if run.returncode:
+                failures.append(f"sync failed: {full}")
+                continue
+            synced += 1
+    say(f"{C_GREEN}✓ GitHub history sync complete{C_RESET}: {synced} repositories")
+    if failures:
+        for failure in failures:
+            warn(failure)
+        raise SystemExit(1)
+
+
 # ---------------------------------------------------------------- aggregation
 
 def compute_daily(db: sqlite3.Connection) -> dict:
@@ -619,6 +870,7 @@ def compute_daily(db: sqlite3.Connection) -> dict:
     commits_per_day: dict[str, int] = {}
     commits_day_proj: dict[tuple[str, str], int] = {}
     edits_per_day: dict[str, int] = {}
+    attributed: dict[str, dict[str, float]] = {}
     proj: dict[str, dict[str, float]] = {}    # project -> {hours, loc_add, loc_del}
 
     def bump_proj(p: str | None, h: float = 0, a: int = 0, d: int = 0):
@@ -634,10 +886,17 @@ def compute_daily(db: sqlite3.Connection) -> dict:
         ts = parse_iso(ts_start)
         day = local_day(ts) if ts else None
         if kind == "session":
+            active_s = int(meta.get("active_s", 0))
+            coauthored_s = int(meta.get("coauthored_s", active_s))
+            ai_only_s = int(meta.get("ai_only_s", max(active_s - coauthored_s, 0)))
             for d, secs in (meta.get("days") or {}).items():
                 hours.setdefault(d, {}).setdefault(source, 0.0)
                 hours[d][source] += secs / 3600
-            bump_proj(project, h=(meta.get("active_s", 0)) / 3600)
+                share = secs / active_s if active_s else 0
+                bucket = attributed.setdefault(d, {"coauthored": 0.0, "ai_only": 0.0})
+                bucket["coauthored"] += coauthored_s * share / 3600
+                bucket["ai_only"] += ai_only_s * share / 3600
+            bump_proj(project, h=active_s / 3600)
         elif kind == "commit" and day:
             commits_per_day[day] = commits_per_day.get(day, 0) + 1
             commits_day_proj[(day, project or "misc")] = \
@@ -665,8 +924,101 @@ def compute_daily(db: sqlite3.Connection) -> dict:
         hours.setdefault(day, {}).setdefault("vscode", 0.0)
         hours[day]["vscode"] += h
 
+    for day, per_source in hours.items():
+        agent_h = sum(per_source.get(s, 0.0)
+                      for s in ("claude", "codex", "cursor", "aider"))
+        human_h = per_source.get("git", 0.0) + per_source.get("vscode", 0.0)
+        bucket = attributed.setdefault(day, {"coauthored": 0.0, "ai_only": 0.0})
+        bucket["own"] = max(human_h - agent_h, 0.0)
+
     return {"hours": hours, "loc": loc, "loc_add": loc_add,
-            "commits": commits_per_day, "projects": proj}
+            "commits": commits_per_day, "projects": proj, "attributed": attributed}
+
+
+def tier_for(value: float, thresholds: tuple[float, float, float, float]) -> str | None:
+    tier = None
+    for name, threshold in zip(("bronze", "silver", "gold", "platinum"), thresholds):
+        if value >= threshold:
+            tier = name
+    return tier
+
+
+def builder_profile(db: sqlite3.Connection, agg: dict, attributed_hours: dict[str, float]) -> dict:
+    metrics = {
+        "sessions": 0, "tools": 0, "user_messages": 0, "test_calls": 0,
+        "parallel_calls": 0, "plan_turns": 0, "turns": 0, "ai_coauthored_commits": 0,
+    }
+    late = timed = 0
+    for source, kind, ts_start, meta_s in db.execute(
+            "SELECT source,kind,ts_start,meta FROM events"):
+        meta = json.loads(meta_s) if meta_s else {}
+        if kind == "session":
+            metrics["sessions"] += 1
+            for key in ("tools", "user_messages", "test_calls", "parallel_calls",
+                        "plan_turns", "turns"):
+                metrics[key] += int(meta.get(key, 0) or 0)
+        elif kind == "commit" and meta.get("ai_coauthor"):
+            metrics["ai_coauthored_commits"] += 1
+        ts = parse_iso(ts_start)
+        if ts:
+            timed += 1
+            hour = ts.astimezone().hour
+            if hour >= 22 or hour < 2:
+                late += 1
+    active_days = max(len(agg["hours"]), 1)
+    commits = sum(agg["commits"].values())
+    sessions = max(metrics["sessions"], 1)
+    user_per_session = metrics["user_messages"] / sessions
+    tools_per_session = metrics["tools"] / sessions
+    plan_rate = metrics["plan_turns"] / max(metrics["turns"], 1)
+    tests_per_session = metrics["test_calls"] / sessions
+    commits_per_day = commits / active_days
+    ai_total = attributed_hours.get("coauthored", 0) + attributed_hours.get("ai_only", 0)
+    autonomy_rate = attributed_hours.get("ai_only", 0) / max(ai_total, 0.001)
+    night_rate = late / max(timed, 1)
+    dimensions = {
+        "steering": min(100, round(user_per_session * 18 + min(tools_per_session, 10) * 3)),
+        "planning": min(100, round(plan_rate * 100)),
+        "engineering": min(100, round(tests_per_session * 28 + min(commits_per_day, 3) * 12)),
+        "execution": min(100, round(min(commits_per_day, 5) * 16 +
+                                    min(metrics["sessions"] / active_days, 1) * 20)),
+        "autonomy": min(100, round(autonomy_rate * 100 +
+                                   min(metrics["parallel_calls"], 10) * 2)),
+    }
+    archetypes = {
+        "steering": ("The Director", "You actively redirect agents and keep decisions explicit."),
+        "planning": ("The Architect", "You plan, structure, and codify before execution."),
+        "engineering": ("The Quality Guardian", "Tests and durable engineering receipts lead your work."),
+        "execution": ("The Shipping Engine", "You turn active days into commits consistently."),
+        "autonomy": ("The Agent Orchestrator", "You delegate long runs and parallel tool work."),
+    }
+    dominant = max(dimensions, key=dimensions.get)
+    badge_defs = [
+        ("Commit Cadence", commits_per_day, (0.5, 1.0, 2.0, 4.0), "commits per active day"),
+        ("Quality Loop", tests_per_session, (0.10, 0.25, 0.50, 1.0), "test calls per AI session"),
+        ("Steering Hand", user_per_session, (1.0, 2.0, 4.0, 8.0), "human turns per AI session"),
+        ("Toolsmith", tools_per_session, (2.0, 5.0, 10.0, 20.0), "tool calls per AI session"),
+        ("Parallel Commander", float(metrics["parallel_calls"]), (1, 5, 15, 40),
+         "parallel-agent dispatches"),
+        ("Night Shift", night_rate * 100, (15, 30, 50, 70), "percent of receipts from 10 PM–2 AM"),
+        ("AI Pairing", float(metrics["ai_coauthored_commits"]), (1, 5, 20, 50),
+         "commits with explicit AI co-author trailers"),
+    ]
+    badges = []
+    for name, value, thresholds, unit in badge_defs:
+        tier = tier_for(value, thresholds)
+        badges.append({"name": name, "tier": tier or "locked", "value": round(value, 2),
+                       "unit": unit, "next": next((t for t in thresholds if value < t), None)})
+    return {
+        "archetype": archetypes[dominant][0],
+        "archetype_reason": archetypes[dominant][1],
+        "dimensions": dimensions, "badges": badges,
+        "metrics": {**metrics, "commits_per_day": round(commits_per_day, 2),
+                    "tools_per_session": round(tools_per_session, 2),
+                    "user_turns_per_session": round(user_per_session, 2),
+                    "plan_rate": round(plan_rate, 3), "night_rate": round(night_rate, 3)},
+        "growth_edge": min(dimensions, key=dimensions.get),
+    }
 
 
 def summarize(db: sqlite3.Connection) -> dict:
@@ -676,7 +1028,12 @@ def summarize(db: sqlite3.Connection) -> dict:
     for day, per in hours.items():
         for s, h in per.items():
             total_by_source[s] = total_by_source.get(s, 0.0) + h
-    total_hours = sum(total_by_source.values())
+    raw_total_hours = sum(total_by_source.values())
+    attributed_hours = {"own": 0.0, "coauthored": 0.0, "ai_only": 0.0}
+    for per in agg["attributed"].values():
+        for key in attributed_hours:
+            attributed_hours[key] += per.get(key, 0.0)
+    total_hours = sum(attributed_hours.values())
 
     rows = db.execute("SELECT source, COUNT(*), SUM(loc_add), SUM(loc_del), SUM(items) "
                       "FROM events GROUP BY source").fetchall()
@@ -704,9 +1061,12 @@ def summarize(db: sqlite3.Connection) -> dict:
     for day, per in hours.items():
         yearly[day[:4]] = yearly.get(day[:4], 0.0) + sum(per.values())
 
+    profile = builder_profile(db, agg, attributed_hours)
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "total_hours": round(total_hours, 1),
+        "raw_total_hours": round(raw_total_hours, 1),
+        "attributed_hours": {k: round(v, 1) for k, v in attributed_hours.items()},
         "target_hours": TARGET_HOURS,
         "pct_to_target": round(100 * total_hours / TARGET_HOURS, 2),
         "remaining_hours": round(max(TARGET_HOURS - total_hours, 0), 1),
@@ -719,6 +1079,7 @@ def summarize(db: sqlite3.Connection) -> dict:
         "total_commits": per_source.get("git", {}).get("items", 0),
         "remote_commits": per_source.get("github", {}).get("items", 0),
         "sessions": per_source.get("claude", {}).get("events", 0) +
+                    per_source.get("codex", {}).get("events", 0) +
                     per_source.get("cursor", {}).get("events", 0) +
                     per_source.get("aider", {}).get("events", 0),
         "active_days": len(days_active),
@@ -730,6 +1091,7 @@ def summarize(db: sqlite3.Connection) -> dict:
                                for k, v in e.items()}}
              for p, e in agg["projects"].items()),
             key=lambda e: -(e["hours"] * 50 + e["loc_add"] / 1000))[:15],
+        "profile": profile,
         "_daily": agg,
     }
 
@@ -754,6 +1116,28 @@ def resolve_authors(db: sqlite3.Connection, cli_authors: str | None) -> list[str
     return guesses
 
 
+def invalidate_source_cache(db: sqlite3.Connection, sources: list[str]) -> int:
+    prefixes = {
+        "claude": [HOME / ".claude" / "projects"],
+        "codex": [HOME / ".codex" / "sessions"],
+        "cursor": [HOME / ".cursor",
+                   HOME / "Library" / "Application Support" / "Cursor"],
+        "vscode": [HOME / "Library" / "Application Support" / "Code"],
+    }
+    removed = 0
+    for source in sources:
+        for prefix in prefixes.get(source, []):
+            cur = db.execute("DELETE FROM file_cache WHERE path LIKE ?",
+                             (str(prefix) + "%",))
+            removed += cur.rowcount
+        if source == "aider":
+            cur = db.execute(
+                "DELETE FROM file_cache WHERE path LIKE '%/.aider.chat.history.md'")
+            removed += cur.rowcount
+    db.commit()
+    return removed
+
+
 def cmd_init(args) -> None:
     db = open_db(args.db)
     authors = resolve_authors(db, args.author)
@@ -770,57 +1154,79 @@ def cmd_scan(args) -> None:
         warn("no author filter — pass --author \"Name,email\" (matching ALL commits otherwise)")
     sources = args.sources.split(",") if args.sources else ALL_SOURCES
     roots = [Path(r) for r in args.roots.split(",")] if args.roots else DEFAULT_ROOTS
+    if args.reprocess_sessions:
+        removed = invalidate_source_cache(db, sources)
+        say(f"  reprocess: invalidated {removed} source cache entries")
     t0 = datetime.now().astimezone()
+    cur = db.execute(
+        "INSERT INTO scans(started_at,finished_at,sources,added,notes,status) "
+        "VALUES(?,?,?,?,?,?)",
+        (t0.isoformat(timespec="seconds"), None, ",".join(sources), 0, "", "running"))
+    scan_id = cur.lastrowid
+    db.commit()
     say(f"{C_BOLD}scan{C_RESET} sources={','.join(sources)}")
     total_added = 0
     all_notes: list[str] = []
     local_repo_names: set[str] = set()
 
-    for s in sources:
-        if s not in ALL_SOURCES:
-            warn(f"unknown source: {s}")
-            continue
-        t = time.time()
-        if s == "git":
-            added, notes = scan_git(db, roots, authors, rediscover=args.rediscover,
-                                    timeout=args.git_timeout)
-            local_repo_names = {r[0].lower() for r in db.execute(
-                "SELECT DISTINCT project FROM events WHERE source='git'") if r[0]}
-        elif s == "claude":
-            added, notes = scan_claude(db)
-        elif s == "cursor":
-            added, notes = scan_cursor(db)
-        elif s == "aider":
-            added, notes = scan_aider(db, roots)
-        elif s == "vscode":
-            added, notes = scan_vscode(db)
-        elif s == "github":
-            if not local_repo_names:
+    try:
+        for s in sources:
+            if s not in ALL_SOURCES:
+                warn(f"unknown source: {s}")
+                continue
+            t = time.time()
+            if s == "git":
+                added, notes = scan_git(db, roots, authors, rediscover=args.rediscover,
+                                        timeout=args.git_timeout)
                 local_repo_names = {r[0].lower() for r in db.execute(
                     "SELECT DISTINCT project FROM events WHERE source='git'") if r[0]}
-            owners = (args.gh_owners or meta_get(db, "gh_owners") or "").split(",")
-            owners = [o for o in owners if o]
-            login = args.gh_login or meta_get(db, "gh_login") or ""
-            if not owners or not login:
-                rc, out = _gh(["api", "user", "--jq", ".login"])
-                if rc == 0 and out.strip():
-                    login = login or out.strip()
-                    owners = owners or [login]
-            if not owners:
-                warn("github: no owners resolved; skip (pass --gh-owners)")
-                continue
-            meta_set(db, "gh_owners", ",".join(owners))
-            meta_set(db, "gh_login", login)
-            added, notes = scan_github(db, owners, login, local_repo_names)
+            elif s == "claude":
+                added, notes = scan_claude(db)
+            elif s == "codex":
+                added, notes = scan_codex(db)
+            elif s == "cursor":
+                added, notes = scan_cursor(db)
+            elif s == "aider":
+                added, notes = scan_aider(db, roots)
+            elif s == "vscode":
+                added, notes = scan_vscode(db)
+            elif s == "github":
+                if not local_repo_names:
+                    local_repo_names = {r[0].lower() for r in db.execute(
+                        "SELECT DISTINCT project FROM events WHERE source='git'") if r[0]}
+                owners = (args.gh_owners or meta_get(db, "gh_owners") or "").split(",")
+                owners = [o for o in owners if o]
+                login = args.gh_login or meta_get(db, "gh_login") or ""
+                if not owners or not login:
+                    rc, out = _gh(["api", "user", "--jq", ".login"])
+                    if rc == 0 and out.strip():
+                        login = login or out.strip()
+                        owners = owners or [login]
+                if not owners:
+                    warn("github: no owners resolved; skip (pass --gh-owners)")
+                    continue
+                meta_set(db, "gh_owners", ",".join(owners))
+                meta_set(db, "gh_login", login)
+                added, notes = scan_github(db, owners, login, local_repo_names)
+            db.commit()
+            total_added += added
+            all_notes += notes
+            db.execute("UPDATE scans SET added=?,notes=? WHERE id=?",
+                       (total_added, "; ".join(all_notes)[-8000:], scan_id))
+            db.commit()
+            say(f"  {C_CYAN}{s}{C_RESET}: +{added} events ({time.time()-t:.1f}s)")
+    except BaseException as exc:
+        note = f"interrupted: {type(exc).__name__}"
+        all_notes.append(note)
+        db.execute("UPDATE scans SET finished_at=?,added=?,notes=?,status='interrupted' "
+                   "WHERE id=?",
+                   (datetime.now().astimezone().isoformat(timespec="seconds"),
+                    total_added, "; ".join(all_notes)[-8000:], scan_id))
         db.commit()
-        total_added += added
-        all_notes += notes
-        say(f"  {C_CYAN}{s}{C_RESET}: +{added} events ({time.time()-t:.1f}s)")
-
-    db.execute("INSERT INTO scans(started_at,finished_at,sources,added,notes) VALUES(?,?,?,?,?)",
-               (t0.isoformat(timespec="seconds"),
-                datetime.now().astimezone().isoformat(timespec="seconds"),
-                ",".join(sources), total_added, "; ".join(all_notes)[:2000]))
+        raise
+    db.execute("UPDATE scans SET finished_at=?,added=?,notes=?,status='complete' WHERE id=?",
+               (datetime.now().astimezone().isoformat(timespec="seconds"),
+                total_added, "; ".join(all_notes)[-8000:], scan_id))
     db.commit()
     say(f"{C_GREEN}✓ scan complete{C_RESET}: +{total_added} events" +
         (f"  ({len(all_notes)} notes — see `status`)" if all_notes else ""))
@@ -830,6 +1236,15 @@ def fmt_h(h: float) -> str:
     return f"{h:,.1f}h"
 
 
+def has_complete_baseline(db: sqlite3.Connection) -> bool:
+    required = set(ALL_SOURCES)
+    for (sources,) in db.execute(
+            "SELECT sources FROM scans WHERE status='complete' ORDER BY id DESC"):
+        if required.issubset({source.strip() for source in (sources or "").split(",")}):
+            return True
+    return False
+
+
 def cmd_status(args) -> None:
     db = open_db(args.db)
     s = summarize(db)
@@ -837,8 +1252,15 @@ def cmd_status(args) -> None:
     filled = min(int(bar_w * s["total_hours"] / s["target_hours"]), bar_w)
     bar = "█" * filled + "░" * (bar_w - filled)
     say(f"{C_BOLD}coding-ledger{C_RESET}  {args.db}")
+    provisional = not has_complete_baseline(db)
     say(f"  {C_GREEN}{bar}{C_RESET} {fmt_h(s['total_hours'])} / {s['target_hours']:,}h "
         f"({s['pct_to_target']}%)")
+    if provisional:
+        say(f"  {C_YELLOW}PROVISIONAL — no complete all-source baseline is recorded{C_RESET}")
+    say(f"  attributed: own {fmt_h(s['attributed_hours']['own'])} · "
+        f"co-authored {fmt_h(s['attributed_hours']['coauthored'])} · "
+        f"AI-only {fmt_h(s['attributed_hours']['ai_only'])}")
+    say(f"  raw source sum before overlap discount: {fmt_h(s['raw_total_hours'])}")
     say(f"  remaining to journeyman: {fmt_h(s['remaining_hours'])}")
     say("")
     for src, h in s["hours_by_source"].items():
@@ -856,10 +1278,11 @@ def cmd_status(args) -> None:
     say(f"  active days: {s['active_days']:,}   streak: {s['current_streak']}d "
         f"(best {s['best_streak']}d)")
     say(f"  span: {(s['first_activity'] or '?')[:10]} → {(s['last_activity'] or '?')[:10]}")
-    last = db.execute("SELECT finished_at, sources, added, notes FROM scans "
+    last = db.execute("SELECT finished_at, sources, added, notes, status FROM scans "
                       "ORDER BY id DESC LIMIT 1").fetchone()
     if last:
-        say(f"  last scan: {last[0][:19]} [{last[1]}] +{last[2]}")
+        finished = (last[0] or "in progress")[:19]
+        say(f"  last scan: {finished} [{last[1]}] +{last[2]} ({last[4]})")
         if last[3]:
             say(f"  {C_DIM}notes: {last[3][:300]}{C_RESET}")
 
@@ -878,6 +1301,10 @@ def cmd_report(args) -> None:
     L.append(f"- **Total proven hours: {s['total_hours']:,}** "
              f"({s['pct_to_target']}% of the {s['target_hours']:,}h journeyman target, "
              f"{s['remaining_hours']:,}h remaining)")
+    L.append(f"- Attribution: **{s['attributed_hours']['own']:,}h own**, "
+             f"**{s['attributed_hours']['coauthored']:,}h co-authored**, "
+             f"**{s['attributed_hours']['ai_only']:,}h AI-only**")
+    L.append(f"- Raw per-source sum before overlap discount: **{s['raw_total_hours']:,}h**")
     L.append(f"- Local commits: **{s['total_commits']:,}** "
              f"(+{s['loc_added']:,} LOC added, net {s['net_loc']:,})")
     if s["remote_commits"]:
@@ -913,6 +1340,9 @@ def cmd_report(args) -> None:
 def cmd_dashboard(args) -> None:
     db = open_db(args.db)
     s = summarize(db)
+    s["scan_state"] = (db.execute(
+        "SELECT status FROM scans ORDER BY id DESC LIMIT 1").fetchone() or ["provisional"])[0]
+    s["completed_scans"] = 1 if has_complete_baseline(db) else 0
     daily = s.pop("_daily")
     html = render_dashboard(s, daily)
     out = Path(args.out) if args.out else DASHBOARD_PATH
@@ -930,6 +1360,9 @@ def cmd_doctor(args) -> None:
         ("claude", (HOME / ".claude" / "projects").is_dir(),
          f"{len(list((HOME / '.claude' / 'projects').rglob('*.jsonl')))} jsonl"
          if (HOME / ".claude" / "projects").is_dir() else "—"),
+        ("codex", (HOME / ".codex" / "sessions").is_dir(),
+         f"{len(list((HOME / '.codex' / 'sessions').rglob('*.jsonl')))} jsonl"
+         if (HOME / ".codex" / "sessions").is_dir() else "—"),
         ("cursor transcripts", (HOME / ".cursor" / "projects").is_dir(), str(HOME / ".cursor")),
         ("cursor chats db", bool(list((HOME / ".cursor").glob("chats/**/store.db")))
          if (HOME / ".cursor").is_dir() else False, ""),
@@ -1006,7 +1439,7 @@ def chartjs_tag() -> str:
             f'crossorigin="anonymous"></script>')
 
 
-def render_dashboard(s: dict, daily: dict) -> str:
+def _render_dashboard_legacy(s: dict, daily: dict) -> str:
     days = sorted(daily["hours"].keys())
     sources = list(s["hours_by_source"].keys())
     palette = {"claude": "#e07a5f", "git": "#81b29a", "cursor": "#f2cc8f",
@@ -1116,6 +1549,128 @@ new Chart(document.getElementById("loc"), {{ type:"line",
 """
 
 
+def render_dashboard(s: dict, daily: dict) -> str:
+    """Render an offline, evidence-first builder field report."""
+    days = sorted(daily["hours"])
+    sources = list(s["hours_by_source"])
+    palette = {
+        "claude": "#f4a261", "codex": "#e76f51", "git": "#2a9d8f",
+        "cursor": "#e9c46a", "aider": "#9b5de5", "vscode": "#4cc9f0",
+        "github": "#8d99ae",
+    }
+    stacked = {source: [round(daily["hours"][day].get(source, 0), 2) for day in days]
+               for source in sources}
+    attributed = {
+        key: [round(daily["attributed"].get(day, {}).get(key, 0), 2) for day in days]
+        for key in ("own", "coauthored", "ai_only")
+    }
+    profile = s["profile"]
+    payload = json.dumps({
+        "days": days, "sources": sources, "stacked": stacked, "palette": palette,
+        "attributed": attributed, "bySource": s["hours_by_source"],
+        "dimensions": profile["dimensions"],
+        "attributionTotals": s["attributed_hours"],
+    }, separators=(",", ":"))
+    tier_icons = {"bronze": "I", "silver": "II", "gold": "III",
+                  "platinum": "IV", "locked": "—"}
+    badge_cards = "".join(
+        f"""<article class="badge {b['tier']}">
+          <div class="badge-mark">{tier_icons[b['tier']]}</div>
+          <div><div class="eyebrow">{html.escape(b['tier'])}</div>
+          <h3>{html.escape(b['name'])}</h3>
+          <p>{b['value']:,} {html.escape(b['unit'])}</p>
+          <small>{'earned' if b['next'] is None else f"next at {b['next']:,}"}</small></div>
+        </article>""" for b in profile["badges"])
+    project_rows = "".join(
+        f"<tr><td>{html.escape(p['project'])}</td><td>{p['hours']:,}</td>"
+        f"<td>+{p['loc_add']:,}</td><td>-{p['loc_del']:,}</td></tr>"
+        for p in s["top_projects"])
+    scan_label = "verified" if s.get("completed_scans", 0) else "provisional"
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Coding Ledger — Builder Field Report</title>
+{chartjs_tag()}
+<style>
+:root{{--paper:#f0eadb;--ink:#17211d;--muted:#6d7167;--rule:#b9b39f;--acid:#d8ff4f;
+--red:#e76f51;--green:#2a9d8f;--navy:#16324f;--panel:#e6dfce}}
+*{{box-sizing:border-box}} body{{margin:0;background:var(--paper);color:var(--ink);
+font:14px/1.55 "SFMono-Regular","Cascadia Mono","Liberation Mono",monospace;background-image:linear-gradient(rgba(23,33,29,.045) 1px,transparent 1px);
+background-size:100% 28px}} main{{max-width:1480px;margin:auto;padding:28px}}
+h1,h2,h3,p{{margin:0}} h1,h2{{font-family:"Iowan Old Style","Palatino Linotype",Palatino,serif}} h1{{font-size:clamp(3.4rem,9vw,9rem);
+line-height:.79;letter-spacing:-.06em;max-width:1050px}} .topline{{display:flex;justify-content:space-between;
+border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);padding:8px 0;margin-bottom:34px}}
+.eyebrow{{text-transform:uppercase;letter-spacing:.14em;font-size:10px;font-weight:500}} .status{{background:var(--acid);
+padding:2px 8px;border:1px solid var(--ink)}} .hero{{display:grid;grid-template-columns:2.2fr 1fr;gap:40px;
+align-items:end;border-bottom:3px solid var(--ink);padding-bottom:30px}} .archetype{{border-left:1px solid var(--ink);padding-left:24px}}
+.archetype strong{{font:800 2.2rem/1 "Iowan Old Style","Palatino Linotype",serif;display:block;margin:8px 0 12px}}
+.ledger-grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;margin:18px 0}}
+.metric,.panel,.badge{{border:1px solid var(--ink);background:rgba(240,234,219,.9);box-shadow:4px 4px 0 var(--ink)}}
+.metric{{grid-column:span 3;padding:18px;min-height:145px;position:relative;overflow:hidden}}
+.metric.wide{{grid-column:span 6;background:var(--navy);color:#fff}} .metric .number{{font:800 clamp(2.2rem,5vw,5rem)/1 "Iowan Old Style","Palatino Linotype",serif;
+letter-spacing:-.05em;margin:12px 0}} .metric small{{color:var(--muted)}} .metric.wide small{{color:#b9c4c8}}
+.triad{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:18px}} .triad div{{border-top:1px solid #80909a;padding-top:9px}}
+.triad b{{font-size:1.3rem;display:block}} .panel{{padding:20px;margin-bottom:16px}} .panel h2{{font-size:1.6rem;margin-bottom:16px}}
+.two{{display:grid;grid-template-columns:1.35fr 1fr;gap:16px}} .chartbox{{height:320px}} .badges{{display:grid;
+grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}} .badge{{display:flex;gap:15px;padding:15px;min-height:130px}}
+.badge-mark{{width:48px;height:48px;display:grid;place-items:center;border:1px solid var(--ink);border-radius:50%;font-weight:500}}
+.badge h3{{font:600 1.2rem "Iowan Old Style","Palatino Linotype",serif;margin:3px 0 8px}} .badge p,.badge small{{color:var(--muted)}}
+.badge.locked{{opacity:.46;box-shadow:none}} .badge.gold .badge-mark{{background:#e9c46a}} .badge.platinum .badge-mark{{background:var(--acid)}}
+.badge.silver .badge-mark{{background:#d4d8d5}} .badge.bronze .badge-mark{{background:#c88b62}}
+table{{width:100%;border-collapse:collapse}} th,td{{padding:8px;border-bottom:1px solid var(--rule);text-align:right}}
+th:first-child,td:first-child{{text-align:left}} .method{{font-size:12px;color:var(--muted);max-width:900px}}
+footer{{display:flex;justify-content:space-between;border-top:2px solid var(--ink);padding-top:10px;margin-top:30px}}
+@media(max-width:900px){{main{{padding:16px}}.hero,.two{{grid-template-columns:1fr}}.archetype{{border-left:0;border-top:1px solid;padding:18px 0 0}}
+.metric,.metric.wide{{grid-column:span 12}}h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
+</style></head><body><main>
+<div class="topline"><span>CODING LEDGER / BUILDER FIELD REPORT</span>
+<span>{html.escape(s['generated_at'])}</span><span class="status">{scan_label.upper()}</span></div>
+<section class="hero"><div><div class="eyebrow">Receipts over assurances</div>
+<h1>HOW YOU<br>ACTUALLY BUILD.</h1></div>
+<div class="archetype"><div class="eyebrow">Dominant archetype</div>
+<strong>{html.escape(profile['archetype'])}</strong>
+<p>{html.escape(profile['archetype_reason'])}</p>
+<p class="method">Growth edge: {html.escape(profile['growth_edge'])}</p></div></section>
+<section class="ledger-grid">
+<article class="metric wide"><div class="eyebrow">Deduplicated attributed time</div>
+<div class="number">{s['total_hours']:,}h</div>
+<small>Raw source sum {s['raw_total_hours']:,}h · overlap discounted conservatively</small>
+<div class="triad"><div><span>Own</span><b>{s['attributed_hours']['own']:,}h</b></div>
+<div><span>Co-authored</span><b>{s['attributed_hours']['coauthored']:,}h</b></div>
+<div><span>AI-only</span><b>{s['attributed_hours']['ai_only']:,}h</b></div></div></article>
+<article class="metric"><div class="eyebrow">Commits</div><div class="number">{s['total_commits']:,}</div>
+<small>+{s['loc_added']:,} LOC · net {s['net_loc']:,}</small></article>
+<article class="metric"><div class="eyebrow">AI sessions</div><div class="number">{s['sessions']:,}</div>
+<small>Claude · Codex · Cursor · Aider</small></article>
+</section>
+<section class="two"><article class="panel"><h2>Attributed work, over time</h2><div class="chartbox"><canvas id="attr"></canvas></div></article>
+<article class="panel"><h2>Builder dimensions</h2><div class="chartbox"><canvas id="radar"></canvas></div></article></section>
+<article class="panel"><h2>Earned field badges</h2><div class="badges">{badge_cards}</div></article>
+<section class="two"><article class="panel"><h2>Raw hours by source</h2><div class="chartbox"><canvas id="source"></canvas></div></article>
+<article class="panel"><h2>Top projects</h2><table><thead><tr><th>Project</th><th>Hours</th><th>+LOC</th><th>-LOC</th></tr></thead>
+<tbody>{project_rows}</tbody></table></article></section>
+<article class="panel method"><h2>How attribution works</h2><p>Own time is Git and editor activity outside measured agent overlap.
+Co-authored time is agent activity within ten minutes of a human steering turn. AI-only time is autonomous assistant/tool activity outside that window.
+Daily human and agent proxies are overlap-discounted; GitHub aggregates add commits and LOC but never synthetic hours. Badge thresholds are visible and reproducible.
+Transcript bodies, prompts, secrets, and tool output are not stored.</p></article>
+<footer><span>ALL DATA LOCAL</span><span>{s['active_days']} ACTIVE DAYS / BEST STREAK {s['best_streak']}D</span></footer>
+</main><script>
+const D={payload}; Chart.defaults.color="#4f574f"; Chart.defaults.font.family='"SFMono-Regular",monospace';
+Chart.defaults.borderColor="#b9b39f";
+new Chart(document.getElementById("attr"),{{type:"bar",data:{{labels:D.days,datasets:[
+{{label:"Own",data:D.attributed.own,backgroundColor:"#2a9d8f",stack:"a"}},
+{{label:"Co-authored",data:D.attributed.coauthored,backgroundColor:"#e9c46a",stack:"a"}},
+{{label:"AI-only",data:D.attributed.ai_only,backgroundColor:"#e76f51",stack:"a"}}]}},
+options:{{maintainAspectRatio:false,scales:{{x:{{stacked:true,ticks:{{maxTicksLimit:12}}}},y:{{stacked:true}}}}}}}});
+new Chart(document.getElementById("radar"),{{type:"radar",data:{{labels:Object.keys(D.dimensions),
+datasets:[{{data:Object.values(D.dimensions),backgroundColor:"rgba(216,255,79,.38)",borderColor:"#17211d",pointBackgroundColor:"#17211d"}}]}},
+options:{{maintainAspectRatio:false,plugins:{{legend:{{display:false}}}},scales:{{r:{{min:0,max:100,ticks:{{display:false}}}}}}}}}});
+new Chart(document.getElementById("source"),{{type:"doughnut",data:{{labels:Object.keys(D.bySource),
+datasets:[{{data:Object.values(D.bySource),backgroundColor:Object.keys(D.bySource).map(s=>D.palette[s]||"#8d99ae"),borderColor:"#f0eadb"}}]}},
+options:{{maintainAspectRatio:false,cutout:"62%"}}}});
+</script></body></html>"""
+
+
 # ---------------------------------------------------------------- entrypoint
 
 def main() -> None:
@@ -1136,6 +1691,8 @@ def main() -> None:
     p.add_argument("--gh-login", help="your github login for attribution")
     p.add_argument("--rediscover", action="store_true",
                    help="re-walk roots for repos instead of using the cached list")
+    p.add_argument("--reprocess-sessions", action="store_true",
+                   help="reparse selected agent/editor sources even when files are unchanged")
     p.add_argument("--git-timeout", type=int, default=GIT_TIMEOUT_S,
                    help="per-repo git log timeout in seconds (bump for cold iCloud repos)")
     p.set_defaults(fn=cmd_scan)
@@ -1155,6 +1712,13 @@ def main() -> None:
 
     p = sub.add_parser("doctor", help="show which sources are available")
     p.set_defaults(fn=cmd_doctor)
+
+    p = sub.add_parser("sync-github", help="sync lightweight no-checkout GitHub history")
+    p.add_argument("--owners", required=True, help="comma-separated GitHub users/orgs")
+    p.add_argument("--destination", required=True, help="non-iCloud history root")
+    p.add_argument("--limit", type=int, default=400, help="repositories per owner")
+    p.add_argument("--include-archived", action="store_true")
+    p.set_defaults(fn=cmd_sync_github)
 
     p = sub.add_parser("install-daemon", help="install daily launchd scan (macOS)")
     p.add_argument("--hour", type=int, default=21)
