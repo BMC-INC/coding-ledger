@@ -2290,7 +2290,8 @@ letter-spacing:-.05em;margin:12px 0}} .metric small{{color:var(--muted)}} .metri
 .duo{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:18px}} .duo div{{border-top:1px solid #80909a;padding-top:9px}}
 .duo b{{font-size:1.3rem;display:block}} .panel{{padding:20px;margin-bottom:16px}} .panel h2{{font-size:1.6rem;margin-bottom:16px}}
 .two{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:16px}} .chartbox{{height:320px;min-width:0;max-width:100%}}
-.chartbox canvas{{max-width:100%!important}} .badges{{display:grid;
+.chartbox canvas{{max-width:100%!important}} .chart-note{{border-top:1px solid var(--rule);margin-top:14px;padding-top:12px;
+color:var(--muted);font-size:11px;line-height:1.6}} .chart-note b{{color:var(--ink);font-weight:600}} .badges{{display:grid;
 grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}} .badge{{display:flex;gap:15px;padding:15px;min-height:130px}}
 .insights{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}} .insight{{border-top:2px solid var(--ink);padding:15px 2px}}
 .insight strong{{font:800 2.4rem/1 "Iowan Old Style","Palatino Linotype",serif;display:block;margin:10px 0}}
@@ -2328,7 +2329,8 @@ footer{{display:flex;justify-content:space-between;border-top:2px solid var(--in
 <section class="two"><article class="panel"><h2>Attributed work, over time</h2><div class="chartbox"><canvas id="attr"></canvas></div></article>
 <article class="panel"><h2>Builder dimensions</h2><div class="chartbox"><canvas id="radar"></canvas></div></article></section>
 <article class="panel"><h2>Earned field badges</h2><div class="badges">{badge_cards}</div></article>
-<section class="two"><article class="panel"><h2>Raw hours by source</h2><div class="chartbox"><canvas id="source"></canvas></div></article>
+<section class="two"><article class="panel"><h2>Raw hours by source</h2><div class="chartbox"><canvas id="source"></canvas></div>
+<p class="chart-note"><b>How to read this:</b> these are independent evidence streams before concurrency removal, so they do not add up to the attributed headline. Agent time uses timestamped sessions with a 30-minute idle break and one-minute floor. Git uses a daily commit-density proxy capped at six hours; editor history uses two minutes per edit capped at 90 minutes. GitHub aggregates add commits and LOC, never hours.</p></article>
 <article class="panel"><h2>Top projects</h2><table><thead><tr><th>Project</th><th>Hours</th><th>+LOC</th><th>-LOC</th></tr></thead>
 <tbody>{project_rows}</tbody></table></article></section>
 <article class="panel method"><h2>How attribution works</h2><p>The scorecard has two categories: Your Coding and AI Coding.
