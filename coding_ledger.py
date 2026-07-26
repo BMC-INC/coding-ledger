@@ -13,6 +13,9 @@ Sources:
   aider    .aider.chat.history.md files
   vscode   VS Code Local History (edit-level activity proxy)
   codex    Codex sessions (~/.codex/sessions/**/*.jsonl), metadata only
+  gemini   Gemini CLI sessions (~/.gemini/tmp/*/chats/session-*.json[l])
+  antigravity Antigravity IDE agent and edit receipts
+  grok     Grok Build sessions (~/.grok/sessions/**/events.jsonl)
   github   remote repos via `gh` (weekly LOC for repos not cloned locally)
 
 Usage:
@@ -50,7 +53,10 @@ LEDGER_DIR = Path(os.environ.get("CODING_LEDGER_DIR", HOME / ".coding-ledger"))
 DEFAULT_DB = Path(os.environ.get("CODING_LEDGER_DB", LEDGER_DIR / "ledger.db"))
 DASHBOARD_PATH = LEDGER_DIR / "dashboard.html"
 
-ALL_SOURCES = ["git", "claude", "codex", "cursor", "aider", "vscode", "github"]
+ALL_SOURCES = [
+    "git", "claude", "codex", "gemini", "antigravity", "grok",
+    "cursor", "aider", "vscode", "github",
+]
 DEFAULT_ROOTS = [HOME / "Projects", HOME / "dev", HOME / "Documents" / "Codex"]
 
 IDLE_GAP_S = 30 * 60          # gap that splits a session
@@ -609,6 +615,118 @@ def scan_codex(db: sqlite3.Connection) -> tuple[int, list[str]]:
     return added, []
 
 
+def _gemini_tool_count(content: object) -> int:
+    """Count tool-call envelopes by key without retaining their arguments."""
+    if isinstance(content, list):
+        return sum(_gemini_tool_count(item) for item in content)
+    if not isinstance(content, dict):
+        return 0
+    count = sum(1 for key in content
+                if key.lower() in {"toolcall", "tool_call", "functioncall",
+                                   "function_call"})
+    return count + sum(_gemini_tool_count(value) for value in content.values()
+                       if isinstance(value, (dict, list)))
+
+
+def parse_gemini_session(path: Path, project: str) -> dict | None:
+    """Extract only timing, role, and tool-count metadata from a Gemini session."""
+    try:
+        if path.suffix == ".jsonl":
+            records = []
+            with path.open("r", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict):
+                        records.append(row)
+        else:
+            root = json.loads(path.read_text(errors="replace"))
+            records = [root] if isinstance(root, dict) else []
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not records:
+        return None
+
+    header = records[0]
+    session_id = str(header.get("sessionId") or path.stem)
+    message_rows: list[dict] = []
+    for row in records:
+        messages = row.get("messages")
+        if isinstance(messages, list):
+            message_rows.extend(item for item in messages if isinstance(item, dict))
+        elif row.get("type") in {"user", "gemini", "assistant", "model", "tool"}:
+            message_rows.append(row)
+
+    activity: list[tuple[datetime, str]] = []
+    users = assistants = tools = 0
+    for message in message_rows:
+        ts = parse_iso(message.get("timestamp", ""))
+        role = str(message.get("type") or message.get("role") or "").lower()
+        if role == "user":
+            kind = "user"
+            users += 1
+        elif role == "tool":
+            kind = "tool"
+        else:
+            kind = "assistant"
+            assistants += 1
+        tools += _gemini_tool_count(message.get("content"))
+        if ts:
+            activity.append((ts, kind))
+
+    if not activity:
+        start = parse_iso(header.get("startTime", ""))
+        end = parse_iso(header.get("lastUpdated", ""))
+        if start:
+            activity.append((start, "assistant"))
+        if end and end != start:
+            activity.append((end, "assistant"))
+    if not activity:
+        return None
+
+    active_s, days, attribution = sessions_from_activity(activity)
+    stamps = [ts for ts, _ in activity]
+    return {
+        "session_id": session_id, "project": project,
+        "ts_start": min(stamps), "ts_end": max(stamps),
+        "active_s": active_s, "days": days, **attribution,
+        "items": assistants, "tools": tools, "user_messages": users,
+        "test_calls": 0, "parallel_calls": 0,
+    }
+
+
+def scan_gemini(db: sqlite3.Connection) -> tuple[int, list[str]]:
+    root = HOME / ".gemini" / "tmp"
+    if not root.is_dir():
+        return 0, ["no ~/.gemini/tmp"]
+    files = sorted(
+        path for path in root.glob("*/chats/session-*")
+        if path.is_file() and path.suffix in {".json", ".jsonl"})
+    say(f"  gemini: {len(files)} session files")
+    added = 0
+    for path in files:
+        if file_unchanged(db, path):
+            continue
+        project = path.parent.parent.name
+        parsed = parse_gemini_session(path, project)
+        file_mark(db, path)
+        if not parsed:
+            continue
+        rel = path.relative_to(root)
+        replace_event(
+            db, f"gemini:{rel}", source="gemini", kind="session",
+            ts_start=parsed["ts_start"], ts_end=parsed["ts_end"],
+            project=parsed["project"], items=parsed["items"],
+            meta={key: value for key, value in parsed.items()
+                  if key not in {"session_id", "project", "ts_start", "ts_end", "items"}}
+                 | {"session_id": parsed["session_id"], "file": str(path)})
+        db.commit()
+        added += 1
+    return added, []
+
+
 def scan_cursor(db: sqlite3.Connection) -> tuple[int, list[str]]:
     added, notes = 0, []
     # 1. agent transcripts (same format family as claude jsonl)
@@ -1156,6 +1274,7 @@ def invalidate_source_cache(db: sqlite3.Connection, sources: list[str]) -> int:
     prefixes = {
         "claude": [HOME / ".claude" / "projects"],
         "codex": [HOME / ".codex" / "sessions"],
+        "gemini": [HOME / ".gemini" / "tmp"],
         "cursor": [HOME / ".cursor",
                    HOME / "Library" / "Application Support" / "Cursor"],
         "vscode": [HOME / "Library" / "Application Support" / "Code"],
@@ -1220,6 +1339,8 @@ def cmd_scan(args) -> None:
                 added, notes = scan_claude(db)
             elif s == "codex":
                 added, notes = scan_codex(db)
+            elif s == "gemini":
+                added, notes = scan_gemini(db)
             elif s == "cursor":
                 added, notes = scan_cursor(db)
             elif s == "aider":

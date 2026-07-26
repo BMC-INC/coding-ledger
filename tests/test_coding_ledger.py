@@ -100,6 +100,49 @@ class LedgerTestCase(unittest.TestCase):
             "/Users/test/Documents/Codex/2026-07-25/verify-production")
         self.assertEqual(project, "verify-production")
 
+    def test_gemini_parser_extracts_metadata_without_content(self):
+        session = self.root / "session.json"
+        session.write_text(json.dumps({
+            "sessionId": "gemini-1",
+            "startTime": "2026-01-01T12:00:00Z",
+            "lastUpdated": "2026-01-01T12:04:00Z",
+            "messages": [
+                {"type": "user", "timestamp": "2026-01-01T12:00:00Z",
+                 "content": [{"text": "SECRET PROMPT"}]},
+                {"type": "gemini", "timestamp": "2026-01-01T12:00:30Z",
+                 "content": [{"toolCall": {"name": "run_shell_command",
+                                            "args": "SECRET COMMAND"}}]},
+                {"type": "gemini", "timestamp": "2026-01-01T12:04:00Z",
+                 "content": [{"text": "SECRET RESPONSE"}]},
+            ],
+        }))
+        parsed = ledger.parse_gemini_session(session, "widget")
+        self.assertEqual(parsed["session_id"], "gemini-1")
+        self.assertEqual(parsed["project"], "widget")
+        self.assertEqual(parsed["user_messages"], 1)
+        self.assertEqual(parsed["items"], 2)
+        self.assertEqual(parsed["tools"], 1)
+        serialized = json.dumps(parsed, default=str)
+        self.assertNotIn("SECRET", serialized)
+        self.assertNotIn("run_shell_command", serialized)
+
+    def test_gemini_jsonl_parser_handles_incremental_records(self):
+        session = self.root / "session.jsonl"
+        rows = [
+            {"sessionId": "gemini-2", "startTime": "2026-01-01T12:00:00Z",
+             "lastUpdated": "2026-01-01T12:02:00Z"},
+            {"type": "user", "timestamp": "2026-01-01T12:00:00Z",
+             "content": "SECRET"},
+            {"type": "gemini", "timestamp": "2026-01-01T12:02:00Z",
+             "content": "SECRET"},
+        ]
+        session.write_text("\n".join(json.dumps(row) for row in rows))
+        parsed = ledger.parse_gemini_session(session, "widget")
+        self.assertEqual(parsed["session_id"], "gemini-2")
+        self.assertEqual(parsed["user_messages"], 1)
+        self.assertEqual(parsed["items"], 1)
+        self.assertEqual(parsed["active_s"], 120)
+
     def test_sessionization_splits_credit_across_midnight(self):
         start = datetime(2026, 1, 1, 23, 59, 30).astimezone()
         end = start + timedelta(minutes=2)
