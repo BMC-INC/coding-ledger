@@ -2708,8 +2708,8 @@ align-items:center;border:1px solid;padding:2%;margin-bottom:2.5%}} .public-rhyt
 <section class="hero"><div><div class="kicker">Prove how you build</div><h1>Builder<br>field report.</h1></div>
 <div class="identity"><div class="label">Builder</div><strong>{html.escape(builder_name)}</strong>
 <p>{html.escape(profile['archetype'])} · {rhythm['active_days']:,} attributable building days · best streak {s['best_streak']} days</p></div></section>
-<section class="score"><div><div class="label">Attributed development time</div><b>{s['total_hours']:,}h</b>
-<small>{s['raw_total_hours']:,}h raw evidence before correction</small>
+<section class="score"><div><div class="label">Receipt-backed execution time</div><b>{s['total_hours']:,}h</b>
+<small>Evidence floor—not total time worked<br>{s['raw_total_hours']:,}h raw evidence before correction</small>
 <div class="correction"><strong>−{s['overlap_discount_hours']:,}h</strong><span>overlap removed<br>{s['overlap_discount_pct']}% concurrency correction</span></div></div>
 <div><div class="label">Your Coding</div><b>{s['attributed_hours']['your_coding']:,}h</b><small>human-side attribution</small></div>
 <div><div class="label">AI Coding</div><b>{s['attributed_hours']['ai_coding']:,}h</b><small>{a['ai_leverage_pct']}% leverage</small></div></section>
@@ -2730,7 +2730,7 @@ align-items:center;border:1px solid;padding:2%;margin-bottom:2.5%}} .public-rhyt
 <article class="panel"><div class="label">Direction and orchestration</div><h2>{a['parallel_dispatches']:,} parallel dispatches</h2>
 <p>Evidence-backed profile: {html.escape(profile['archetype'])}. Hours measure attributable activity, not code quality, productivity, or business impact.</p></article></section>
 <div class="badges"><span class="label">Earned evidence badges</span><br>{html.escape(badge_names)}</div>
-<section class="method"><strong>How the score is evaluated</strong><p>Git uses a capped daily commit-density proxy; editor history uses capped edit receipts; agents use timestamped activity with a 30-minute idle break. Only AI work within ten minutes of an explicit human steering turn can overlap human evidence. Independent AI runtime remains additive. GitHub aggregates contribute commits and LOC, never synthetic hours. Prompts, responses, source code, secrets, tool output, and repository names are excluded from this export.</p></section>
+<section class="method"><strong>How the score is evaluated</strong><p>Git uses a capped daily commit-density proxy; editor history uses capped edit receipts; agents use timestamped activity with a 30-minute idle break. The ledger does not count keystrokes or infer how long work took before a commit. Unobserved research, architecture, debugging, review, planning, and other work remain uncounted. Only AI work within ten minutes of an explicit human steering turn can overlap human evidence. Independent AI runtime remains additive. GitHub aggregates contribute commits and LOC, never synthetic hours. Prompts, responses, source code, secrets, tool output, and repository names are excluded from this export.</p></section>
 <footer><span>GENERATED LOCALLY · {generated}</span><span>CODING LEDGER · METHODOLOGY V2</span></footer>
 </main></body></html>"""
 
