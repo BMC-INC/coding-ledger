@@ -179,6 +179,20 @@ It does **not** store:
 The database stores minimal provenance: source path, project identifier, day buckets,
 active seconds, attribution seconds, and aggregate counts.
 
+## Public exports
+
+Generate a public-safe scorecard, one-page PDF, and LinkedIn image locally:
+
+```bash
+python3 coding_ledger.py export --name "Your Name"
+```
+
+Exports are written to `~/.coding-ledger/share/` by default. The PDF contains
+selectable text and the social image is 1200×1350 pixels. Both omit prompts,
+responses, source code, secrets, tool output, project names, and repository names.
+They report only aggregate evidence, including the number of repositories with
+matched commits. Chrome, Chromium, or Edge is required for rendering.
+
 ## Scan durability
 
 A scan row is written before processing starts. It is updated after every source and
@@ -207,6 +221,7 @@ scan              Scan selected sources and explicit roots
 status            Show terminal totals, attribution, and scan state
 report            Produce Markdown or JSON
 dashboard         Generate the offline landing page and HTML field report
+export            Generate public-safe HTML, PDF, and LinkedIn image
 doctor            Show discoverable sources, including Codex
 sync-github       Maintain lightweight no-checkout GitHub history
 install-daemon    Install the macOS daily scan

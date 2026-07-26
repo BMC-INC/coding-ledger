@@ -25,6 +25,7 @@ Usage:
   python3 coding_ledger.py status
   python3 coding_ledger.py report --format markdown
   python3 coding_ledger.py dashboard --open
+  python3 coding_ledger.py export
   python3 coding_ledger.py doctor
   python3 coding_ledger.py install-daemon   # daily launchd scan (macOS)
 
@@ -41,10 +42,13 @@ import html
 import json
 import os
 import re
+import signal
+import shutil
 import sqlite3
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -1553,6 +1557,10 @@ def summarize(db: sqlite3.Connection) -> dict:
         "loc_added": sum(agg["loc_add"].values()),
         "github_loc_added": per_source.get("github", {}).get("loc_add", 0),
         "total_commits": per_source.get("git", {}).get("items", 0),
+        "repositories_with_commits": db.execute(
+            "SELECT COUNT(DISTINCT project) FROM events "
+            "WHERE source='git' AND kind='commit' AND project IS NOT NULL"
+        ).fetchone()[0],
         "remote_commits": per_source.get("github", {}).get("items", 0),
         "sessions": session_count,
         "trajectory_receipts": trajectory_receipts,
@@ -1874,6 +1882,105 @@ def cmd_dashboard(args) -> None:
     say(f"{C_GREEN}✓ landing page written{C_RESET} to {landing_out}")
     if args.open:
         subprocess.run(["open", str(landing_out)], check=False)
+
+
+def chromium_executable() -> Path | None:
+    candidates = [
+        Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        Path("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+    ]
+    installed = next((path for path in candidates if path.is_file()), None)
+    if installed:
+        return installed
+    for name in ("google-chrome", "chromium", "chromium-browser", "msedge"):
+        command = shutil.which(name)
+        if command:
+            return Path(command)
+    return None
+
+
+def default_builder_name() -> str:
+    result = subprocess.run(
+        ["git", "config", "--global", "user.name"],
+        capture_output=True, text=True)
+    return result.stdout.strip() or "Independent Builder"
+
+
+def run_chromium_export(command: list[str], output: Path,
+                        timeout_s: float = 20) -> bool:
+    """Run headless Chromium until its artifact is complete, then stop its group."""
+    output.unlink(missing_ok=True)
+    process = subprocess.Popen(
+        command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True)
+    deadline = time.monotonic() + timeout_s
+    last_size = -1
+    stable_checks = 0
+    try:
+        while time.monotonic() < deadline:
+            if output.is_file() and output.stat().st_size > 0:
+                size = output.stat().st_size
+                stable_checks = stable_checks + 1 if size == last_size else 0
+                if stable_checks >= 2:
+                    return True
+                last_size = size
+            if process.poll() is not None and not output.is_file():
+                return False
+            time.sleep(0.2)
+        return False
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=3)
+            except (ProcessLookupError, subprocess.TimeoutExpired):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+
+def cmd_export(args) -> None:
+    """Generate public-safe HTML, PDF, and social-image scorecards locally."""
+    db = open_db(args.db)
+    summary = summarize(db)
+    summary.pop("_daily")
+    output_dir = Path(args.out_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    builder_name = (args.name or default_builder_name()).strip() or "Independent Builder"
+    html_path = output_dir / "coding-ledger-scorecard.html"
+    pdf_path = output_dir / "coding-ledger-scorecard.pdf"
+    image_path = output_dir / "coding-ledger-linkedin.png"
+    html_path.write_text(render_public_scorecard(summary, builder_name))
+
+    browser = chromium_executable()
+    if not browser:
+        raise SystemExit("Chrome, Chromium, or Edge is required to render PDF and PNG exports")
+    with tempfile.TemporaryDirectory(prefix="coding-ledger-export-") as temp_root:
+        common = [
+            str(browser), "--headless=new", "--disable-gpu", "--hide-scrollbars",
+            "--disable-background-networking", "--disable-component-update",
+            "--no-first-run", "--disable-default-apps",
+            "--run-all-compositor-stages-before-draw", "--virtual-time-budget=1500",
+        ]
+        pdf_ok = run_chromium_export(
+            common + [f"--user-data-dir={temp_root}/pdf", "--no-pdf-header-footer",
+                      f"--print-to-pdf={pdf_path}", html_path.as_uri()],
+            pdf_path)
+        image_ok = run_chromium_export(
+            common + [f"--user-data-dir={temp_root}/image",
+                      "--window-size=1200,1350", "--force-device-scale-factor=1",
+                      f"--screenshot={image_path}", html_path.as_uri()],
+            image_path)
+    failures = [
+        label for label, ok in (("PDF", pdf_ok), ("LinkedIn image", image_ok))
+        if not ok]
+    if failures:
+        raise SystemExit(f"Export failed: {', '.join(failures)}")
+    say(f"{C_GREEN}✓ public scorecard HTML{C_RESET}: {html_path}")
+    say(f"{C_GREEN}✓ shareable PDF{C_RESET}: {pdf_path}")
+    say(f"{C_GREEN}✓ LinkedIn image{C_RESET}: {image_path}")
 
 
 def cmd_doctor(args) -> None:
@@ -2354,6 +2461,70 @@ options:{{maintainAspectRatio:false,cutout:"62%"}}}});
 </script></body></html>"""
 
 
+def render_public_scorecard(s: dict, builder_name: str) -> str:
+    """Render a public-safe scorecard without project or repository names."""
+    a = s["analytics"]
+    profile = s["profile"]
+    earned = [badge for badge in profile["badges"] if badge["tier"] != "locked"]
+    badge_names = " · ".join(badge["name"] for badge in earned[:6]) or "Evidence building"
+    generated = s["generated_at"][:10]
+    momentum = a["multi_project_commit_change_pct"]
+    momentum_text = (
+        f"{'+' if momentum >= 0 else ''}{momentum}%"
+        if momentum is not None else "N/A")
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(builder_name)} — Coding Ledger Scorecard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23d8ff4f'/%3E%3Ctext x='13' y='45' font-size='40'%3EC%3C/text%3E%3C/svg%3E">
+<style>
+@page{{size:letter portrait;margin:0}} *{{box-sizing:border-box}}
+:root{{--paper:#f0eadb;--ink:#17211d;--muted:#687068;--acid:#d8ff4f;--navy:#16324f;--rule:#a9a58f}}
+html,body{{margin:0;background:#d5d0c2;color:var(--ink);font-family:"SFMono-Regular","Cascadia Mono",monospace}}
+.sheet{{width:100vw;min-height:100vh;background:var(--paper);padding:4.5%;display:flex;flex-direction:column;
+background-image:linear-gradient(rgba(23,33,29,.045) 1px,transparent 1px);background-size:100% 28px}}
+.top{{display:flex;justify-content:space-between;border-top:3px solid var(--ink);border-bottom:1px solid var(--ink);
+padding:10px 0;font-size:11px;letter-spacing:.12em;text-transform:uppercase}} .status{{background:var(--acid);padding:2px 8px;border:1px solid}}
+.hero{{display:grid;grid-template-columns:1.6fr 1fr;gap:5%;align-items:end;padding:5% 0;border-bottom:3px solid}}
+.kicker,.label{{font-size:10px;text-transform:uppercase;letter-spacing:.14em}} h1{{font:800 clamp(48px,7vw,94px)/.84 "Iowan Old Style",serif;
+letter-spacing:-.055em;margin:12px 0 0;text-transform:uppercase}} .identity{{border-left:1px solid;padding-left:8%}}
+.identity strong{{display:block;font:700 clamp(25px,3vw,42px)/1 "Iowan Old Style",serif;margin:10px 0}}
+.identity p,.method p{{font-size:11px;line-height:1.55;color:var(--muted);margin:0}}
+.score{{display:grid;grid-template-columns:1.25fr 1fr 1fr;background:var(--navy);color:white;margin:2.5% 0}}
+.score>div{{padding:4%;border-right:1px solid #657984}} .score>div:last-child{{border:0}}
+.score b{{display:block;font:800 clamp(34px,5vw,68px)/1 "Iowan Old Style",serif;margin:9px 0}}
+.score small{{color:#bdc8cc;font-size:10px}} .metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:1.4%;margin-bottom:2.5%}}
+.metric{{border-top:2px solid;padding:2.5% 1%}} .metric b{{font:700 clamp(25px,3vw,42px)/1 "Iowan Old Style",serif;display:block;margin:8px 0}}
+.metric span{{font-size:10px;color:var(--muted)}} .band{{display:grid;grid-template-columns:1fr 1fr;gap:2%;margin-bottom:2.5%}}
+.panel{{border:1px solid;padding:3%;background:rgba(240,234,219,.88)}} .panel h2{{font:700 clamp(22px,2.5vw,34px)/1 "Iowan Old Style",serif;margin:8px 0 12px}}
+.panel p{{font-size:11px;line-height:1.55;margin:0;color:var(--muted)}} .badges{{border-top:1px solid var(--rule);padding-top:2%;font-size:10px}}
+.method{{margin-top:auto;border-top:2px solid;padding-top:2%;display:grid;grid-template-columns:1fr 2.2fr;gap:4%}}
+.method strong{{font:700 17px "Iowan Old Style",serif}} footer{{display:flex;justify-content:space-between;margin-top:2%;font-size:9px;color:var(--muted)}}
+@media print{{html,body{{background:white}}.sheet{{width:8.5in;height:11in;min-height:0;padding:.38in;break-after:avoid}}}}
+</style></head><body><main class="sheet">
+<div class="top"><span>Coding Ledger / Public Builder Scorecard</span><span class="status">Evidence-based</span></div>
+<section class="hero"><div><div class="kicker">Prove how you build</div><h1>Builder<br>field report.</h1></div>
+<div class="identity"><div class="label">Builder</div><strong>{html.escape(builder_name)}</strong>
+<p>{html.escape(profile['archetype'])} · {s['active_days']:,} active days · best streak {s['best_streak']} days</p></div></section>
+<section class="score"><div><div class="label">Attributed development time</div><b>{s['total_hours']:,}h</b>
+<small>{s['raw_total_hours']:,}h raw evidence · −{s['overlap_discount_pct']}% concurrency</small></div>
+<div><div class="label">Your Coding</div><b>{s['attributed_hours']['your_coding']:,}h</b><small>human-side attribution</small></div>
+<div><div class="label">AI Coding</div><b>{s['attributed_hours']['ai_coding']:,}h</b><small>{a['ai_leverage_pct']}% leverage</small></div></section>
+<section class="metrics">
+<div class="metric"><div class="label">Commits</div><b>{s['total_commits']:,}</b><span>matched local receipts</span></div>
+<div class="metric"><div class="label">Repositories</div><b>{s['repositories_with_commits']:,}</b><span>with matched commits</span></div>
+<div class="metric"><div class="label">AI sessions</div><b>{s['sessions']:,}</b><span>metadata-only evidence</span></div>
+<div class="metric"><div class="label">Session → commit</div><b>{a['session_commit_conversion_pct']}%</b><span>within seven days</span></div></section>
+<section class="band"><article class="panel"><div class="label">Portfolio breadth</div><h2>{a['project_diversity_pct']}% project diversity</h2>
+<p>Neutral inverse-concentration measure across {a['active_projects']:,} active project identities. Diversity momentum: {momentum_text} commits on multi-project workflow days.</p></article>
+<article class="panel"><div class="label">Verification and direction</div><h2>{a['verification_per_session']} test calls / session</h2>
+<p>{a['parallel_dispatches']:,} parallel dispatches. Evidence-backed profile: {html.escape(profile['archetype'])}. Hours measure activity, not code quality or business impact.</p></article></section>
+<div class="badges"><span class="label">Earned evidence badges</span><br>{html.escape(badge_names)}</div>
+<section class="method"><strong>How the score is evaluated</strong><p>Git uses a capped daily commit-density proxy; editor history uses capped edit receipts; agents use timestamped activity with a 30-minute idle break. Only AI work within ten minutes of an explicit human steering turn can overlap human evidence. Independent AI runtime remains additive. GitHub aggregates contribute commits and LOC, never synthetic hours. Prompts, responses, source code, secrets, tool output, and repository names are excluded from this export.</p></section>
+<footer><span>GENERATED LOCALLY · {generated}</span><span>CODING LEDGER · METHODOLOGY V2</span></footer>
+</main></body></html>"""
+
+
 # ---------------------------------------------------------------- entrypoint
 
 def main() -> None:
@@ -2392,6 +2563,12 @@ def main() -> None:
     p.add_argument("--open", action="store_true", help="open in browser")
     p.add_argument("--out", help="output path (default ~/.coding-ledger/dashboard.html)")
     p.set_defaults(fn=cmd_dashboard)
+
+    p = sub.add_parser("export", help="generate public-safe PDF and social image")
+    p.add_argument("--name", help="builder name shown on the public scorecard")
+    p.add_argument("--out-dir", default=str(LEDGER_DIR / "share"),
+                   help="export directory (default ~/.coding-ledger/share)")
+    p.set_defaults(fn=cmd_export)
 
     p = sub.add_parser("doctor", help="show which sources are available")
     p.set_defaults(fn=cmd_doctor)

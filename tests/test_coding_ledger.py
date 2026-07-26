@@ -109,6 +109,16 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(summary["total_hours"], 4)
         self.assertEqual(summary["overlap_discount_hours"], 3)
 
+    def test_repository_count_uses_commit_bearing_projects(self):
+        start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        for offset, project in enumerate(("alpha", "beta", "alpha")):
+            ts = start + timedelta(minutes=offset)
+            ledger.insert_event(
+                self.db, f"repo-count:{offset}", "git", "commit", ts, ts,
+                project, items=1)
+        self.db.commit()
+        self.assertEqual(ledger.summarize(self.db)["repositories_with_commits"], 2)
+
     def test_codex_parser_extracts_metadata_without_transcript_text(self):
         session = self.root / "rollout.jsonl"
         rows = [
@@ -359,6 +369,13 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("Gemini", landing)
         self.assertIn("Grok Build", landing)
         self.assertNotIn("SECRET", landing)
+        public = ledger.render_public_scorecard(summary, "Test Builder")
+        self.assertIn("Test Builder", public)
+        self.assertIn("Public Builder Scorecard", public)
+        self.assertIn("Repositories", public)
+        self.assertIn("How the score is evaluated", public)
+        self.assertNotIn("widget", public)
+        self.assertNotIn("SECRET", public)
 
     def test_project_diversity_compares_multi_project_momentum(self):
         start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
