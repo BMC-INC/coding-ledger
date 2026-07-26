@@ -1540,7 +1540,7 @@ def workflow_analytics(db: sqlite3.Connection, agg: dict, total_hours: float,
     for timestamps in commits_by_project.values():
         timestamps.sort()
 
-    eligible = matched = 0
+    eligible = matched_24h = matched_7d = 0
     lags: list[float] = []
     for project, ts_end, ts_start in db.execute(
             "SELECT project,ts_end,ts_start FROM events WHERE kind='session'"):
@@ -1553,7 +1553,9 @@ def workflow_analytics(db: sqlite3.Connection, agg: dict, total_hours: float,
         if index < len(commits):
             lag_h = (commits[index] - end).total_seconds() / 3600
             if 0 <= lag_h <= 7 * 24:
-                matched += 1
+                matched_7d += 1
+                if lag_h <= 24:
+                    matched_24h += 1
                 lags.append(lag_h)
 
     metrics = profile["metrics"]
@@ -1576,8 +1578,11 @@ def workflow_analytics(db: sqlite3.Connection, agg: dict, total_hours: float,
             metrics["test_calls"] / sessions, 2) if sessions else 0.0,
         "parallel_dispatches": metrics["parallel_calls"],
         "session_commit_eligible": eligible,
-        "session_commit_matches": matched,
-        "session_commit_conversion_pct": round(100 * matched / eligible, 1)
+        "session_commit_24h_matches": matched_24h,
+        "session_commit_24h_conversion_pct": round(
+            100 * matched_24h / eligible, 1) if eligible else 0.0,
+        "session_commit_matches": matched_7d,
+        "session_commit_conversion_pct": round(100 * matched_7d / eligible, 1)
         if eligible else 0.0,
         "median_session_to_commit_hours": round(statistics.median(lags), 1)
         if lags else None,
@@ -2070,15 +2075,22 @@ def run_chromium_export(command: list[str], output: Path,
             time.sleep(0.2)
         return False
     finally:
+        # Chromium may let the parent exit while profile-writing children keep
+        # the temporary user-data directory busy. Terminate the whole process
+        # group even when the parent has already reported completion.
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         if process.poll() is None:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
                 process.wait(timeout=3)
-            except (ProcessLookupError, subprocess.TimeoutExpired):
+            except subprocess.TimeoutExpired:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                process.wait(timeout=3)
 
 
 def cmd_export(args) -> None:
@@ -2097,7 +2109,11 @@ def cmd_export(args) -> None:
     browser = chromium_executable()
     if not browser:
         raise SystemExit("Chrome, Chromium, or Edge is required to render PDF and PNG exports")
-    with tempfile.TemporaryDirectory(prefix="coding-ledger-export-") as temp_root:
+    # Chrome profile helpers can briefly recreate lock files during shutdown.
+    # The profile contains only disposable export state, so cleanup contention
+    # must not turn successfully rendered artifacts into a failed command.
+    with tempfile.TemporaryDirectory(
+            prefix="coding-ledger-export-", ignore_cleanup_errors=True) as temp_root:
         common = [
             str(browser), "--headless=new", "--disable-gpu", "--hide-scrollbars",
             "--disable-background-networking", "--disable-component-update",
@@ -2653,7 +2669,7 @@ def render_public_scorecard(s: dict, builder_name: str) -> str:
 @page{{size:letter portrait;margin:0}} *{{box-sizing:border-box}}
 :root{{--paper:#f0eadb;--ink:#17211d;--muted:#687068;--acid:#d8ff4f;--navy:#16324f;--rule:#a9a58f}}
 html,body{{margin:0;background:#d5d0c2;color:var(--ink);font-family:"SFMono-Regular","Cascadia Mono",monospace}}
-.sheet{{width:100vw;min-height:100vh;background:var(--paper);padding:4.5%;display:flex;flex-direction:column;
+.sheet{{width:100%;min-height:100vh;background:var(--paper);padding:4.5%;display:flex;flex-direction:column;
 background-image:linear-gradient(rgba(23,33,29,.045) 1px,transparent 1px);background-size:100% 28px}}
 .top{{display:flex;justify-content:space-between;border-top:3px solid var(--ink);border-bottom:1px solid var(--ink);
 padding:10px 0;font-size:11px;letter-spacing:.12em;text-transform:uppercase}} .status{{background:var(--acid);padding:2px 8px;border:1px solid}}
@@ -2663,39 +2679,56 @@ letter-spacing:-.055em;margin:12px 0 0;text-transform:uppercase}} .identity{{bor
 .identity strong{{display:block;font:700 clamp(25px,3vw,42px)/1 "Iowan Old Style",serif;margin:10px 0}}
 .identity p,.method p{{font-size:11px;line-height:1.55;color:var(--muted);margin:0}}
 .score{{display:grid;grid-template-columns:1.25fr 1fr 1fr;background:var(--navy);color:white;margin:2.5% 0}}
-.score>div{{padding:4%;border-right:1px solid #657984}} .score>div:last-child{{border:0}}
+.score>div{{padding:4%;border-right:1px solid #657984;min-width:0}} .score>div:last-child{{border:0}}
 .score b{{display:block;font:800 clamp(34px,5vw,68px)/1 "Iowan Old Style",serif;margin:9px 0}}
-.score small{{color:#bdc8cc;font-size:10px}} .metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:1.4%;margin-bottom:2.5%}}
-.metric{{border-top:2px solid;padding:2.5% 1%}} .metric b{{font:700 clamp(25px,3vw,42px)/1 "Iowan Old Style",serif;display:block;margin:8px 0}}
-.metric span{{font-size:10px;color:var(--muted)}} .public-rhythm{{display:grid;grid-template-columns:auto 1fr;gap:4%;
+.score small{{color:#bdc8cc;font-size:10px}} .correction{{display:flex;align-items:center;gap:9px;border-top:1px solid #657984;
+padding-top:9px;margin-top:9px}} .correction strong{{font:700 18px/1 "Iowan Old Style",serif;color:var(--acid)}}
+.correction span{{font-size:8px;line-height:1.35;text-transform:uppercase;letter-spacing:.08em;color:#dbe3e5}}
+.metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:1.4%;margin-bottom:2.5%}}
+.metric{{border-top:2px solid;padding:2.5% 1%;min-width:0}} .metric b{{font:700 clamp(25px,3vw,42px)/1 "Iowan Old Style",serif;display:block;margin:8px 0}}
+.metric span{{font-size:9px;color:var(--muted);line-height:1.35;display:block}} .metric-pair{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}
+.metric-pair>div{{min-width:0}} .metric-pair div+div{{border-left:1px solid var(--rule);padding-left:8px}} .metric-pair b{{font-size:clamp(22px,2.6vw,36px)}}
+.public-rhythm{{display:grid;grid-template-columns:auto 1fr;gap:4%;
 align-items:center;border:1px solid;padding:2%;margin-bottom:2.5%}} .public-rhythm b{{font:700 clamp(20px,2.4vw,32px) "Iowan Old Style",serif;white-space:nowrap}}
 .public-rhythm p{{font-size:10px;line-height:1.5;color:var(--muted);margin:0}} .band{{display:grid;grid-template-columns:1fr 1fr;gap:2%;margin-bottom:2.5%}}
 .panel{{border:1px solid;padding:3%;background:rgba(240,234,219,.88)}} .panel h2{{font:700 clamp(22px,2.5vw,34px)/1 "Iowan Old Style",serif;margin:8px 0 12px}}
 .panel p{{font-size:11px;line-height:1.55;margin:0;color:var(--muted)}} .badges{{border-top:1px solid var(--rule);padding-top:2%;font-size:10px}}
 .method{{margin-top:auto;border-top:2px solid;padding-top:2%;display:grid;grid-template-columns:1fr 2.2fr;gap:4%}}
 .method strong{{font:700 17px "Iowan Old Style",serif}} footer{{display:flex;justify-content:space-between;margin-top:2%;font-size:9px;color:var(--muted)}}
-@media print{{html,body{{background:white}}.sheet{{width:8.5in;height:11in;min-height:0;padding:.38in;break-after:avoid}}}}
+@media screen and (max-width:600px){{.sheet{{padding:4%}}.label{{font-size:8px;letter-spacing:.08em}}
+.score b{{font-size:clamp(22px,7vw,34px)}}.correction{{gap:5px}}.correction strong{{font-size:14px}}
+.metric-pair{{gap:4px}}.metric-pair div+div{{padding-left:4px}}.metric-pair b{{font-size:clamp(11px,3vw,20px)}}
+.metric span{{font-size:7px;overflow-wrap:anywhere}}}}
+@media print{{html,body{{background:white}}.sheet{{width:8.5in;height:11in;min-height:0;padding:.34in;break-after:avoid}}
+.hero{{padding:3.5% 0}}.score{{margin:1.8% 0}}.score>div{{padding:3%}}.correction{{padding-top:6px;margin-top:6px}}
+.metrics,.public-rhythm,.band{{margin-bottom:1.8%}}.metric{{padding:1.8% 1%}}.panel{{padding:2.2%}}
+.panel h2{{margin:6px 0 8px}}.badges{{padding-top:1.4%}}.method{{padding-top:1.4%}}footer{{margin-top:1.4%}}}}
 </style></head><body><main class="sheet">
 <div class="top"><span>Coding Ledger / Public Builder Scorecard</span><span class="status">Evidence-based</span></div>
 <section class="hero"><div><div class="kicker">Prove how you build</div><h1>Builder<br>field report.</h1></div>
 <div class="identity"><div class="label">Builder</div><strong>{html.escape(builder_name)}</strong>
 <p>{html.escape(profile['archetype'])} · {rhythm['active_days']:,} attributable building days · best streak {s['best_streak']} days</p></div></section>
 <section class="score"><div><div class="label">Attributed development time</div><b>{s['total_hours']:,}h</b>
-<small>{s['raw_total_hours']:,}h raw evidence · −{s['overlap_discount_pct']}% concurrency</small></div>
+<small>{s['raw_total_hours']:,}h raw evidence before correction</small>
+<div class="correction"><strong>−{s['overlap_discount_hours']:,}h</strong><span>overlap removed<br>{s['overlap_discount_pct']}% concurrency correction</span></div></div>
 <div><div class="label">Your Coding</div><b>{s['attributed_hours']['your_coding']:,}h</b><small>human-side attribution</small></div>
 <div><div class="label">AI Coding</div><b>{s['attributed_hours']['ai_coding']:,}h</b><small>{a['ai_leverage_pct']}% leverage</small></div></section>
 <section class="metrics">
 <div class="metric"><div class="label">Commits</div><b>{s['total_commits']:,}</b><span>matched local receipts</span></div>
-<div class="metric"><div class="label">Repositories</div><b>{s['repositories_with_commits']:,}</b><span>with matched commits</span></div>
+<div class="metric"><div class="label">Evidence scope</div><div class="metric-pair">
+<div><b>{s['repositories_with_commits']:,}</b><span>commit-bearing repositories</span></div>
+<div><b>{a['active_projects']:,}</b><span>observed workspace identities</span></div></div></div>
 <div class="metric"><div class="label">AI sessions</div><b>{s['sessions']:,}</b><span>metadata-only evidence</span></div>
-<div class="metric"><div class="label">Session → commit</div><b>{a['session_commit_conversion_pct']}%</b><span>within seven days</span></div></section>
+<div class="metric"><div class="label">Session → commit</div><div class="metric-pair">
+<div><b>{a['session_commit_24h_conversion_pct']}%</b><span>within 24 hours</span></div>
+<div><b>{a['session_commit_conversion_pct']}%</b><span>within 7 days</span></div></div></div></section>
 <section class="public-rhythm"><b>{rhythm['active_days']:,} on / {rhythm['off_days']:,} off</b>
 <p><span class="label">Building rhythm across {rhythm['calendar_days']:,} calendar days · {rhythm['start_day']} → {rhythm['end_day']}</span><br>
 {rhythm['streak_count']:,} building streaks · {rhythm['longest_break_days']:,}d longest break · recent: {html.escape(recent_rhythm)}</p></section>
 <section class="band"><article class="panel"><div class="label">Portfolio breadth</div><h2>{a['project_diversity_pct']}% project diversity</h2>
 <p>Neutral inverse-concentration measure across {a['active_projects']:,} active project identities. Diversity momentum: {momentum_text} commits on multi-project workflow days.</p></article>
-<article class="panel"><div class="label">Verification and direction</div><h2>{a['verification_per_session']} test calls / session</h2>
-<p>{a['parallel_dispatches']:,} parallel dispatches. Evidence-backed profile: {html.escape(profile['archetype'])}. Hours measure activity, not code quality or business impact.</p></article></section>
+<article class="panel"><div class="label">Direction and orchestration</div><h2>{a['parallel_dispatches']:,} parallel dispatches</h2>
+<p>Evidence-backed profile: {html.escape(profile['archetype'])}. Hours measure attributable activity, not code quality, productivity, or business impact.</p></article></section>
 <div class="badges"><span class="label">Earned evidence badges</span><br>{html.escape(badge_names)}</div>
 <section class="method"><strong>How the score is evaluated</strong><p>Git uses a capped daily commit-density proxy; editor history uses capped edit receipts; agents use timestamped activity with a 30-minute idle break. Only AI work within ten minutes of an explicit human steering turn can overlap human evidence. Independent AI runtime remains additive. GitHub aggregates contribute commits and LOC, never synthetic hours. Prompts, responses, source code, secrets, tool output, and repository names are excluded from this export.</p></section>
 <footer><span>GENERATED LOCALLY · {generated}</span><span>CODING LEDGER · METHODOLOGY V2</span></footer>

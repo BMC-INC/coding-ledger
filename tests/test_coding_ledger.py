@@ -119,6 +119,43 @@ class LedgerTestCase(unittest.TestCase):
         self.db.commit()
         self.assertEqual(ledger.summarize(self.db)["repositories_with_commits"], 2)
 
+    def test_session_commit_conversion_reports_24h_and_7d_windows(self):
+        sessions = [
+            ("one", "2026-01-01T12:00:00+00:00"),
+            ("two", "2026-01-02T12:00:00+00:00"),
+            ("three", "2026-01-05T12:00:00+00:00"),
+        ]
+        commits = [
+            ("one", "2026-01-01T14:00:00+00:00"),
+            ("two", "2026-01-04T12:00:00+00:00"),
+            ("three", "2026-01-13T12:00:00+00:00"),
+        ]
+        for uid, timestamp in sessions:
+            ts = datetime.fromisoformat(timestamp)
+            ledger.insert_event(
+                self.db, f"session:{uid}", "codex", "session", ts, ts,
+                "widget", meta={"active_s": 60, "days": {ts.date().isoformat(): 60}})
+        for uid, timestamp in commits:
+            ts = datetime.fromisoformat(timestamp)
+            ledger.insert_event(
+                self.db, f"commit:{uid}", "git", "commit", ts, ts,
+                "widget", items=1)
+        self.db.commit()
+        analytics = ledger.summarize(self.db)["analytics"]
+        self.assertEqual(analytics["session_commit_eligible"], 3)
+        self.assertEqual(analytics["session_commit_24h_matches"], 1)
+        self.assertEqual(analytics["session_commit_matches"], 2)
+        self.assertEqual(analytics["session_commit_24h_conversion_pct"], 33.3)
+        self.assertEqual(analytics["session_commit_conversion_pct"], 66.7)
+        scorecard = ledger.render_public_scorecard(
+            ledger.summarize(self.db), "Test Builder")
+        self.assertIn("within 24 hours", scorecard)
+        self.assertIn("within 7 days", scorecard)
+        self.assertIn("commit-bearing repositories", scorecard)
+        self.assertIn("observed workspace identities", scorecard)
+        self.assertIn("overlap removed", scorecard)
+        self.assertNotIn("test calls / session", scorecard)
+
     def test_activity_rhythm_alternates_building_and_off_runs(self):
         rhythm = ledger.activity_rhythm(
             ["2026-01-01", "2026-01-02", "2026-01-04",
@@ -425,7 +462,8 @@ class LedgerTestCase(unittest.TestCase):
         public = ledger.render_public_scorecard(summary, "Test Builder")
         self.assertIn("Test Builder", public)
         self.assertIn("Public Builder Scorecard", public)
-        self.assertIn("Repositories", public)
+        self.assertIn("commit-bearing repositories", public)
+        self.assertIn("observed workspace identities", public)
         self.assertIn("How the score is evaluated", public)
         self.assertIn("Building rhythm", public)
         self.assertIn("on /", public)
