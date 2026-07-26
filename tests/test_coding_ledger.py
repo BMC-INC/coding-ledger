@@ -1,4 +1,5 @@
 import argparse
+import base64
 import contextlib
 import importlib.util
 import io
@@ -142,6 +143,20 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(parsed["user_messages"], 1)
         self.assertEqual(parsed["items"], 1)
         self.assertEqual(parsed["active_s"], 120)
+
+    def test_antigravity_counts_opaque_trajectory_receipts(self):
+        state = self.root / "state.vscdb"
+        con = sqlite3.connect(state)
+        con.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)")
+        # Two top-level field-1 length-delimited protobuf messages.
+        payload = b"\x0a\x03one\x0a\x03two"
+        con.execute(
+            "INSERT INTO ItemTable(key,value) VALUES(?,?)",
+            ("antigravityUnifiedStateSync.trajectorySummaries",
+             base64.b64encode(payload).decode()))
+        con.commit()
+        con.close()
+        self.assertEqual(ledger.antigravity_trajectory_count(state), 2)
 
     def test_sessionization_splits_credit_across_midnight(self):
         start = datetime(2026, 1, 1, 23, 59, 30).astimezone()

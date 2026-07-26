@@ -34,6 +34,7 @@ Ledger: ~/.coding-ledger/ledger.db (override: --db or $CODING_LEDGER_DB)
 from __future__ import annotations
 
 import argparse
+import base64
 import fnmatch
 import html
 import json
@@ -57,6 +58,8 @@ ALL_SOURCES = [
     "git", "claude", "codex", "gemini", "antigravity", "grok",
     "cursor", "aider", "vscode", "github",
 ]
+AGENT_SOURCES = ("claude", "codex", "gemini", "grok", "cursor", "aider")
+EDITOR_SOURCES = ("vscode", "antigravity")
 DEFAULT_ROOTS = [HOME / "Projects", HOME / "dev", HOME / "Documents" / "Codex"]
 
 IDLE_GAP_S = 30 * 60          # gap that splits a session
@@ -727,6 +730,100 @@ def scan_gemini(db: sqlite3.Connection) -> tuple[int, list[str]]:
     return added, []
 
 
+def _read_varint(data: bytes, offset: int) -> tuple[int, int] | None:
+    value = shift = 0
+    while offset < len(data) and shift < 70:
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7f) << shift
+        if not byte & 0x80:
+            return value, offset
+        shift += 7
+    return None
+
+
+def _count_top_level_protobuf_messages(data: bytes, field_number: int = 1) -> int:
+    """Count top-level length-delimited fields without decoding private payloads."""
+    offset = count = 0
+    while offset < len(data):
+        key_result = _read_varint(data, offset)
+        if not key_result:
+            break
+        key, offset = key_result
+        wire_type = key & 7
+        current_field = key >> 3
+        if wire_type == 0:
+            value_result = _read_varint(data, offset)
+            if not value_result:
+                break
+            _, offset = value_result
+        elif wire_type == 1:
+            offset += 8
+        elif wire_type == 2:
+            length_result = _read_varint(data, offset)
+            if not length_result:
+                break
+            length, offset = length_result
+            if current_field == field_number:
+                count += 1
+            offset += length
+        elif wire_type == 5:
+            offset += 4
+        else:
+            break
+    return count
+
+
+def antigravity_trajectory_count(state_db: Path) -> int:
+    """Count opaque trajectory summaries; never deserialize their private content."""
+    try:
+        con = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+        row = con.execute(
+            "SELECT value FROM ItemTable WHERE key=?",
+            ("antigravityUnifiedStateSync.trajectorySummaries",)).fetchone()
+        con.close()
+        if not row or not row[0]:
+            return 0
+        encoded = row[0].encode() if isinstance(row[0], str) else row[0]
+        return _count_top_level_protobuf_messages(
+            base64.b64decode(encoded, validate=True))
+    except (OSError, sqlite3.Error, ValueError):
+        return 0
+
+
+def scan_antigravity(db: sqlite3.Connection) -> tuple[int, list[str]]:
+    roots = [
+        HOME / "Library" / "Application Support" / "Antigravity",
+        HOME / "Library" / "Application Support" / "Antigravity IDE",
+    ]
+    available = [root for root in roots if root.is_dir()]
+    if not available:
+        return 0, ["no Antigravity application data"]
+    added = 0
+    for root in available:
+        history = root / "User" / "History"
+        if history.is_dir():
+            history_added, _ = _scan_vscode_history(db, history, "antigravity")
+            added += history_added
+        state_db = root / "User" / "globalStorage" / "state.vscdb"
+        if not state_db.is_file() or file_unchanged(db, state_db):
+            continue
+        count = antigravity_trajectory_count(state_db)
+        file_mark(db, state_db)
+        if count:
+            modified = datetime.fromtimestamp(state_db.stat().st_mtime, timezone.utc)
+            product = root.name
+            replace_event(
+                db, f"antigravity:trajectories:{product}",
+                source="antigravity", kind="agent_receipts",
+                ts_start=modified, ts_end=modified, project=product, items=count,
+                meta={"trajectory_receipts": count, "file": str(state_db)})
+            db.commit()
+            added += 1
+    say(f"  antigravity: {len(available)} product stores")
+    return added, []
+
+
 def scan_cursor(db: sqlite3.Connection) -> tuple[int, list[str]]:
     added, notes = 0, []
     # 1. agent transcripts (same format family as claude jsonl)
@@ -987,7 +1084,7 @@ def compute_daily(db: sqlite3.Connection) -> dict:
     loc_add: dict[str, int] = {}
     commits_per_day: dict[str, int] = {}
     commits_day_proj: dict[tuple[str, str], int] = {}
-    edits_per_day: dict[str, int] = {}
+    edits_per_day: dict[tuple[str, str], int] = {}
     attributed: dict[str, dict[str, float]] = {}
     proj: dict[str, dict[str, float]] = {}    # project -> {hours, loc_add, loc_del}
 
@@ -1023,7 +1120,8 @@ def compute_daily(db: sqlite3.Connection) -> dict:
             loc_add[day] = loc_add.get(day, 0) + la
             bump_proj(project, a=la, d=ld)
         elif kind == "edit" and day:
-            edits_per_day[day] = edits_per_day.get(day, 0) + items
+            key = (day, source)
+            edits_per_day[key] = edits_per_day.get(key, 0) + items
         elif kind == "gh_week" and day:
             bump_proj(project, a=la, d=ld)
 
@@ -1037,15 +1135,15 @@ def compute_daily(db: sqlite3.Connection) -> dict:
         # distribute the day's density credit to projects by commit share
         for p, cnt in day_proj.get(day, {}).items():
             bump_proj(p, h=h * cnt / n)
-    for day, n in edits_per_day.items():
+    for (day, source), n in edits_per_day.items():
         h = min(n * VSCODE_PER_EDIT_S, VSCODE_DAY_CAP_S) / 3600
-        hours.setdefault(day, {}).setdefault("vscode", 0.0)
-        hours[day]["vscode"] += h
+        hours.setdefault(day, {}).setdefault(source, 0.0)
+        hours[day][source] += h
 
     for day, per_source in hours.items():
-        agent_h = sum(per_source.get(s, 0.0)
-                      for s in ("claude", "codex", "cursor", "aider"))
-        human_h = per_source.get("git", 0.0) + per_source.get("vscode", 0.0)
+        agent_h = sum(per_source.get(source, 0.0) for source in AGENT_SOURCES)
+        human_h = per_source.get("git", 0.0) + sum(
+            per_source.get(source, 0.0) for source in EDITOR_SOURCES)
         bucket = attributed.setdefault(day, {"coauthored": 0.0, "ai_only": 0.0})
         bucket["own"] = max(human_h - agent_h, 0.0)
 
@@ -1275,6 +1373,10 @@ def invalidate_source_cache(db: sqlite3.Connection, sources: list[str]) -> int:
         "claude": [HOME / ".claude" / "projects"],
         "codex": [HOME / ".codex" / "sessions"],
         "gemini": [HOME / ".gemini" / "tmp"],
+        "antigravity": [
+            HOME / "Library" / "Application Support" / "Antigravity",
+            HOME / "Library" / "Application Support" / "Antigravity IDE",
+        ],
         "cursor": [HOME / ".cursor",
                    HOME / "Library" / "Application Support" / "Cursor"],
         "vscode": [HOME / "Library" / "Application Support" / "Code"],
@@ -1341,6 +1443,8 @@ def cmd_scan(args) -> None:
                 added, notes = scan_codex(db)
             elif s == "gemini":
                 added, notes = scan_gemini(db)
+            elif s == "antigravity":
+                added, notes = scan_antigravity(db)
             elif s == "cursor":
                 added, notes = scan_cursor(db)
             elif s == "aider":
