@@ -304,6 +304,8 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn('rel="icon"', rendered)
         self.assertIn("Earned field badges", rendered)
         self.assertIn("Builder dimensions", rendered)
+        self.assertIn("Workflow analytics", rendered)
+        self.assertIn("Session → commit", rendered)
         self.assertNotIn("SECRET", rendered)
 
 

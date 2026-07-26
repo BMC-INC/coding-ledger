@@ -35,12 +35,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import fnmatch
 import html
 import json
 import os
 import re
 import sqlite3
+import statistics
 import subprocess
 import sys
 import time
@@ -1361,6 +1363,64 @@ def builder_profile(db: sqlite3.Connection, agg: dict, evidence_hours: dict[str,
     }
 
 
+def workflow_analytics(db: sqlite3.Connection, agg: dict, total_hours: float,
+                       ai_hours: float, profile: dict) -> dict:
+    project_hours = sorted(
+        (entry["hours"] for entry in agg["projects"].values() if entry["hours"] > 0),
+        reverse=True)
+    project_total = sum(project_hours)
+    focus_pct = 100 * project_hours[0] / project_total if project_total else 0.0
+    fragmentation = 0.0
+    if project_total:
+        fragmentation = 100 * (1 - sum((hours / project_total) ** 2
+                                        for hours in project_hours))
+
+    commits_by_project: dict[str, list[datetime]] = {}
+    for project, ts_start in db.execute(
+            "SELECT project,ts_start FROM events WHERE kind='commit'"):
+        ts = parse_iso(ts_start)
+        if ts:
+            commits_by_project.setdefault(project or "misc", []).append(ts)
+    for timestamps in commits_by_project.values():
+        timestamps.sort()
+
+    eligible = matched = 0
+    lags: list[float] = []
+    for project, ts_end, ts_start in db.execute(
+            "SELECT project,ts_end,ts_start FROM events WHERE kind='session'"):
+        end = parse_iso(ts_end or ts_start)
+        commits = commits_by_project.get(project or "misc", [])
+        if not end or not commits:
+            continue
+        eligible += 1
+        index = bisect.bisect_left(commits, end)
+        if index < len(commits):
+            lag_h = (commits[index] - end).total_seconds() / 3600
+            if 0 <= lag_h <= 7 * 24:
+                matched += 1
+                lags.append(lag_h)
+
+    metrics = profile["metrics"]
+    sessions = metrics["sessions"]
+    return {
+        "ai_leverage_pct": round(100 * ai_hours / total_hours, 1) if total_hours else 0.0,
+        "active_projects": len(project_hours),
+        "top_project_focus_pct": round(focus_pct, 1),
+        "fragmentation_pct": round(fragmentation, 1),
+        "verification_calls": metrics["test_calls"],
+        "verification_per_session": round(
+            metrics["test_calls"] / sessions, 2) if sessions else 0.0,
+        "parallel_dispatches": metrics["parallel_calls"],
+        "session_commit_eligible": eligible,
+        "session_commit_matches": matched,
+        "session_commit_conversion_pct": round(100 * matched / eligible, 1)
+        if eligible else 0.0,
+        "median_session_to_commit_hours": round(statistics.median(lags), 1)
+        if lags else None,
+        "session_commit_window_days": 7,
+    }
+
+
 def summarize(db: sqlite3.Connection) -> dict:
     agg = compute_daily(db)
     hours = agg["hours"]
@@ -1410,6 +1470,13 @@ def summarize(db: sqlite3.Connection) -> dict:
         yearly[day[:4]] = yearly.get(day[:4], 0.0) + sum(per.values())
 
     profile = builder_profile(db, agg, evidence_hours)
+    analytics = workflow_analytics(
+        db, agg, total_hours, allocation["ai_coding"], profile)
+    session_count = db.execute(
+        "SELECT COUNT(*) FROM events WHERE kind='session'").fetchone()[0]
+    trajectory_receipts = sum(
+        int((json.loads(row[0]) if row[0] else {}).get("trajectory_receipts", 0))
+        for row in db.execute("SELECT meta FROM events WHERE kind='agent_receipts'"))
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "total_hours": rounded_total,
@@ -1433,10 +1500,8 @@ def summarize(db: sqlite3.Connection) -> dict:
         "github_loc_added": per_source.get("github", {}).get("loc_add", 0),
         "total_commits": per_source.get("git", {}).get("items", 0),
         "remote_commits": per_source.get("github", {}).get("items", 0),
-        "sessions": per_source.get("claude", {}).get("events", 0) +
-                    per_source.get("codex", {}).get("events", 0) +
-                    per_source.get("cursor", {}).get("events", 0) +
-                    per_source.get("aider", {}).get("events", 0),
+        "sessions": session_count,
+        "trajectory_receipts": trajectory_receipts,
         "active_days": len(days_active),
         "first_activity": first[0], "last_activity": first[1],
         "best_streak": best_streak, "current_streak": cur_streak,
@@ -1447,6 +1512,7 @@ def summarize(db: sqlite3.Connection) -> dict:
              for p, e in agg["projects"].items()),
             key=lambda e: -(e["hours"] * 50 + e["loc_add"] / 1000))[:15],
         "profile": profile,
+        "analytics": analytics,
         "_daily": agg,
     }
 
@@ -1644,6 +1710,10 @@ def cmd_status(args) -> None:
     say("")
     say(f"  local commits: {s['total_commits']:,}   net LOC: {s['net_loc']:,}   "
         f"sessions: {s['sessions']:,}")
+    analytics = s["analytics"]
+    say(f"  AI leverage: {analytics['ai_leverage_pct']}%   "
+        f"top-project focus: {analytics['top_project_focus_pct']}%   "
+        f"session→commit: {analytics['session_commit_conversion_pct']}%")
     say(f"  active days: {s['active_days']:,}   streak: {s['current_streak']}d "
         f"(best {s['best_streak']}d)")
     say(f"  span: {(s['first_activity'] or '?')[:10]} → {(s['last_activity'] or '?')[:10]}")
@@ -1683,6 +1753,7 @@ def cmd_report(args) -> None:
         L.append(f"- Remote-only GitHub commits: **{s['remote_commits']:,}** "
                  f"(+{s['github_loc_added']:,} LOC)")
     L.append(f"- AI-assisted sessions: **{s['sessions']:,}**")
+    L.append(f"- AI leverage: **{s['analytics']['ai_leverage_pct']}%** of attributed time")
     L.append(f"- Active days: **{s['active_days']:,}** — current streak "
              f"{s['current_streak']}d, best {s['best_streak']}d")
     L.append(f"- Span: {(s['first_activity'] or '?')[:10]} → {(s['last_activity'] or '?')[:10]}\n")
@@ -1701,6 +1772,21 @@ def cmd_report(args) -> None:
     L.append("|---------|------:|-----:|-----:|")
     for p in s["top_projects"]:
         L.append(f"| {p['project']} | {p['hours']:,} | {p['loc_add']:,} | {p['loc_del']:,} |")
+    a = s["analytics"]
+    L.append("\n## Workflow analytics\n")
+    L.append(f"- Top-project focus: **{a['top_project_focus_pct']}%** across "
+             f"**{a['active_projects']:,}** projects")
+    L.append(f"- Project fragmentation index: **{a['fragmentation_pct']}%**")
+    L.append(f"- Verification density: **{a['verification_per_session']}** detected "
+             f"test calls per AI session")
+    L.append(f"- Parallel-agent dispatches: **{a['parallel_dispatches']:,}**")
+    L.append(f"- Session-to-commit conversion: **{a['session_commit_conversion_pct']}%** "
+             f"within {a['session_commit_window_days']} days "
+             f"({a['session_commit_matches']:,}/{a['session_commit_eligible']:,} "
+             "project-matchable sessions)")
+    if a["median_session_to_commit_hours"] is not None:
+        L.append(f"- Median session-to-commit lag: "
+                 f"**{a['median_session_to_commit_hours']:,}h**")
     out = "\n".join(L) + "\n"
     if args.out:
         Path(args.out).write_text(out)
@@ -1735,6 +1821,17 @@ def cmd_doctor(args) -> None:
         ("codex", (HOME / ".codex" / "sessions").is_dir(),
          f"{len(list((HOME / '.codex' / 'sessions').rglob('*.jsonl')))} jsonl"
          if (HOME / ".codex" / "sessions").is_dir() else "—"),
+        ("gemini", (HOME / ".gemini" / "tmp").is_dir(),
+         f"{len(list((HOME / '.gemini' / 'tmp').glob('*/chats/session-*')))} sessions"
+         if (HOME / ".gemini" / "tmp").is_dir() else "—"),
+        ("antigravity", any((HOME / "Library" / "Application Support" / name).is_dir()
+                            for name in ("Antigravity", "Antigravity IDE")),
+         "editor history + opaque trajectory receipts"),
+        ("grok build", (Path(os.environ.get("GROK_HOME") or HOME / ".grok")
+                        / "sessions").is_dir(),
+         f"{len(list((Path(os.environ.get('GROK_HOME') or HOME / '.grok') / 'sessions').rglob('events.jsonl')))} sessions"
+         if (Path(os.environ.get("GROK_HOME") or HOME / ".grok") / "sessions").is_dir()
+         else "—"),
         ("cursor transcripts", (HOME / ".cursor" / "projects").is_dir(), str(HOME / ".cursor")),
         ("cursor chats db", bool(list((HOME / ".cursor").glob("chats/**/store.db")))
          if (HOME / ".cursor").is_dir() else False, ""),
@@ -1928,6 +2025,7 @@ def render_dashboard(s: dict, daily: dict) -> str:
     palette = {
         "claude": "#f4a261", "codex": "#e76f51", "git": "#2a9d8f",
         "cursor": "#e9c46a", "aider": "#9b5de5", "vscode": "#4cc9f0",
+        "gemini": "#4285f4", "antigravity": "#7b61ff", "grok": "#111111",
         "github": "#8d99ae",
     }
     stacked = {source: [round(daily["hours"][day].get(source, 0), 2) for day in days]
@@ -1968,6 +2066,29 @@ def render_dashboard(s: dict, daily: dict) -> str:
         f"<td>+{p['loc_add']:,}</td><td>-{p['loc_del']:,}</td></tr>"
         for p in s["top_projects"])
     scan_label = "verified" if s.get("completed_scans", 0) else "provisional"
+    analytics = s["analytics"]
+    lag = (f"{analytics['median_session_to_commit_hours']:,}h median lag"
+           if analytics["median_session_to_commit_hours"] is not None
+           else "lag unavailable")
+    analytics_cards = f"""
+      <article class="insight"><div class="eyebrow">AI leverage</div>
+        <strong>{analytics['ai_leverage_pct']}%</strong>
+        <p>AI Coding as a share of attributed time.</p></article>
+      <article class="insight"><div class="eyebrow">Project focus</div>
+        <strong>{analytics['top_project_focus_pct']}%</strong>
+        <p>Time concentrated in the leading project; {analytics['active_projects']:,} active projects.</p></article>
+      <article class="insight"><div class="eyebrow">Verification loop</div>
+        <strong>{analytics['verification_per_session']}</strong>
+        <p>Detected test calls per AI session.</p></article>
+      <article class="insight"><div class="eyebrow">Session → commit</div>
+        <strong>{analytics['session_commit_conversion_pct']}%</strong>
+        <p>Converted within {analytics['session_commit_window_days']} days · {lag}.</p></article>
+      <article class="insight"><div class="eyebrow">Parallel work</div>
+        <strong>{analytics['parallel_dispatches']:,}</strong>
+        <p>Evidence-backed agent and subagent dispatches.</p></article>
+      <article class="insight"><div class="eyebrow">Fragmentation</div>
+        <strong>{analytics['fragmentation_pct']}%</strong>
+        <p>Portfolio dispersion using the inverse Herfindahl concentration index.</p></article>"""
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1996,6 +2117,9 @@ letter-spacing:-.05em;margin:12px 0}} .metric small{{color:var(--muted)}} .metri
 .duo b{{font-size:1.3rem;display:block}} .panel{{padding:20px;margin-bottom:16px}} .panel h2{{font-size:1.6rem;margin-bottom:16px}}
 .two{{display:grid;grid-template-columns:1.35fr 1fr;gap:16px}} .chartbox{{height:320px}} .badges{{display:grid;
 grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}} .badge{{display:flex;gap:15px;padding:15px;min-height:130px}}
+.insights{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}} .insight{{border-top:2px solid var(--ink);padding:15px 2px}}
+.insight strong{{font:800 2.4rem/1 "Iowan Old Style","Palatino Linotype",serif;display:block;margin:10px 0}}
+.insight p{{color:var(--muted);max-width:34ch}}
 .badge-mark{{width:48px;height:48px;display:grid;place-items:center;border:1px solid var(--ink);border-radius:50%;font-weight:500}}
 .badge h3{{font:600 1.2rem "Iowan Old Style","Palatino Linotype",serif;margin:3px 0 8px}} .badge p,.badge small{{color:var(--muted)}}
 .badge.locked{{opacity:.46;box-shadow:none}} .badge.gold .badge-mark{{background:#e9c46a}} .badge.platinum .badge-mark{{background:var(--acid)}}
@@ -2004,7 +2128,7 @@ table{{width:100%;border-collapse:collapse}} th,td{{padding:8px;border-bottom:1p
 th:first-child,td:first-child{{text-align:left}} .method{{font-size:12px;color:var(--muted);max-width:900px}}
 footer{{display:flex;justify-content:space-between;border-top:2px solid var(--ink);padding-top:10px;margin-top:30px}}
 @media(max-width:900px){{main{{padding:16px}}.hero,.two{{grid-template-columns:1fr}}.archetype{{border-left:0;border-top:1px solid;padding:18px 0 0}}
-.metric,.metric.wide{{grid-column:span 12}}h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
+.metric,.metric.wide{{grid-column:span 12}}.insights{{grid-template-columns:1fr}}h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
 </style></head><body><main>
 <div class="topline"><span>CODING LEDGER / BUILDER FIELD REPORT</span>
 <span>{html.escape(s['generated_at'])}</span><span class="status">{scan_label.upper()}</span></div>
@@ -2023,8 +2147,9 @@ footer{{display:flex;justify-content:space-between;border-top:2px solid var(--in
 <article class="metric"><div class="eyebrow">Commits</div><div class="number">{s['total_commits']:,}</div>
 <small>+{s['loc_added']:,} LOC · net {s['net_loc']:,}</small></article>
 <article class="metric"><div class="eyebrow">AI sessions</div><div class="number">{s['sessions']:,}</div>
-<small>Claude · Codex · Cursor · Aider</small></article>
+<small>Claude · Codex · Gemini · Grok · Cursor · Aider</small></article>
 </section>
+<article class="panel"><h2>Workflow analytics</h2><div class="insights">{analytics_cards}</div></article>
 <section class="two"><article class="panel"><h2>Attributed work, over time</h2><div class="chartbox"><canvas id="attr"></canvas></div></article>
 <article class="panel"><h2>Builder dimensions</h2><div class="chartbox"><canvas id="radar"></canvas></div></article></section>
 <article class="panel"><h2>Earned field badges</h2><div class="badges">{badge_cards}</div></article>
