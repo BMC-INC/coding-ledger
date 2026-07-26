@@ -55,6 +55,21 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(attribution["coauthored_s"], 10 * 60)
         self.assertEqual(attribution["ai_only_s"], 10 * 60)
 
+    def test_coauthored_hours_are_allocated_by_base_share(self):
+        allocation = ledger.allocate_coding_hours(100, 90, 50)
+        self.assertAlmostEqual(allocation["your_share"], 2 / 3)
+        self.assertAlmostEqual(allocation["ai_share"], 1 / 3)
+        self.assertAlmostEqual(allocation["your_coding"], 160)
+        self.assertAlmostEqual(allocation["ai_coding"], 80)
+        self.assertAlmostEqual(
+            allocation["your_coding"] + allocation["ai_coding"], 240)
+
+    def test_coauthored_hours_split_evenly_without_base_evidence(self):
+        allocation = ledger.allocate_coding_hours(0, 10, 0)
+        self.assertEqual(allocation["your_coding"], 5)
+        self.assertEqual(allocation["ai_coding"], 5)
+        self.assertEqual(allocation["your_share"], 0.5)
+
     def test_codex_parser_extracts_metadata_without_transcript_text(self):
         session = self.root / "rollout.jsonl"
         rows = [

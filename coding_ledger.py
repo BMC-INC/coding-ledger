@@ -935,6 +935,27 @@ def compute_daily(db: sqlite3.Connection) -> dict:
             "commits": commits_per_day, "projects": proj, "attributed": attributed}
 
 
+def allocate_coding_hours(own: float, coauthored: float, ai_only: float) -> dict[str, float]:
+    """Allocate shared work into the two visible coding categories.
+
+    The human and AI base hours determine the proportional split. If neither
+    side has base evidence, shared time is split evenly rather than assigned
+    arbitrarily to one side.
+    """
+    own = max(float(own), 0.0)
+    coauthored = max(float(coauthored), 0.0)
+    ai_only = max(float(ai_only), 0.0)
+    base_total = own + ai_only
+    your_share = own / base_total if base_total else 0.5
+    ai_share = 1.0 - your_share
+    return {
+        "your_coding": own + coauthored * your_share,
+        "ai_coding": ai_only + coauthored * ai_share,
+        "your_share": your_share,
+        "ai_share": ai_share,
+    }
+
+
 def tier_for(value: float, thresholds: tuple[float, float, float, float]) -> str | None:
     tier = None
     for name, threshold in zip(("bronze", "silver", "gold", "platinum"), thresholds):
