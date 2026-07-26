@@ -44,6 +44,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -824,6 +825,108 @@ def scan_antigravity(db: sqlite3.Connection) -> tuple[int, list[str]]:
     return added, []
 
 
+def grok_project_from_session_path(path: Path, sessions_root: Path) -> str:
+    try:
+        cwd_dir = path.relative_to(sessions_root).parts[0]
+    except (ValueError, IndexError):
+        return path.parent.name
+    cwd_file = sessions_root / cwd_dir / ".cwd"
+    try:
+        cwd = cwd_file.read_text(errors="replace").strip()
+    except OSError:
+        cwd = urllib.parse.unquote(cwd_dir)
+    return project_from_path(cwd, path.parent.name)
+
+
+def parse_grok_session(path: Path, project: str) -> dict | None:
+    """Read Grok Build's documented event log without transcript content."""
+    activity: list[tuple[datetime, str]] = []
+    session_id = path.parent.name
+    users = assistants = tools = parallel = plan_turns = turns = 0
+    models: set[str] = set()
+    try:
+        with path.open("r", errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = parse_iso(row.get("ts", ""))
+                event_type = str(row.get("type") or "")
+                kind: str | None = None
+                if event_type == "turn_started":
+                    session_id = str(row.get("session_id") or session_id)
+                    model = row.get("model_id")
+                    if isinstance(model, str) and model:
+                        models.add(model)
+                    kind = "user"
+                    users += 1
+                    turns += 1
+                elif event_type == "interjected":
+                    kind = "user"
+                    users += 1
+                elif event_type == "tool_started":
+                    kind = "tool"
+                    tools += 1
+                elif event_type in {"first_token", "turn_ended"}:
+                    kind = "assistant"
+                    assistants += event_type == "turn_ended"
+                if event_type.startswith("goal_planner_"):
+                    plan_turns += event_type == "goal_planner_fired"
+                if (event_type.endswith("_fired") and
+                        event_type.startswith(("goal_planner", "goal_strategist",
+                                               "goal_summarizer", "goal_classifier"))):
+                    parallel += 1
+                relationship = str(row.get("session_relationship") or "").lower()
+                if relationship and relationship != "primary":
+                    parallel += event_type == "turn_started"
+                if ts and kind:
+                    activity.append((ts, kind))
+    except OSError:
+        return None
+    if not activity:
+        return None
+    active_s, days, attribution = sessions_from_activity(activity)
+    stamps = [ts for ts, _ in activity]
+    return {
+        "session_id": session_id, "project": project,
+        "ts_start": min(stamps), "ts_end": max(stamps),
+        "active_s": active_s, "days": days, **attribution,
+        "items": assistants, "tools": tools, "user_messages": users,
+        "test_calls": 0, "parallel_calls": parallel,
+        "plan_turns": plan_turns, "turns": turns, "models": sorted(models),
+    }
+
+
+def scan_grok(db: sqlite3.Connection) -> tuple[int, list[str]]:
+    grok_home = Path(os.environ.get("GROK_HOME") or HOME / ".grok").expanduser()
+    sessions_root = grok_home / "sessions"
+    if not sessions_root.is_dir():
+        return 0, [f"no Grok Build sessions at {sessions_root}"]
+    files = sorted(sessions_root.rglob("events.jsonl"))
+    say(f"  grok: {len(files)} session files")
+    added = 0
+    for path in files:
+        if file_unchanged(db, path):
+            continue
+        parsed = parse_grok_session(
+            path, grok_project_from_session_path(path, sessions_root))
+        file_mark(db, path)
+        if not parsed:
+            continue
+        rel = path.relative_to(sessions_root)
+        replace_event(
+            db, f"grok:{rel}", source="grok", kind="session",
+            ts_start=parsed["ts_start"], ts_end=parsed["ts_end"],
+            project=parsed["project"], items=parsed["items"],
+            meta={key: value for key, value in parsed.items()
+                  if key not in {"session_id", "project", "ts_start", "ts_end", "items"}}
+                 | {"session_id": parsed["session_id"], "file": str(path)})
+        db.commit()
+        added += 1
+    return added, []
+
+
 def scan_cursor(db: sqlite3.Connection) -> tuple[int, list[str]]:
     added, notes = 0, []
     # 1. agent transcripts (same format family as claude jsonl)
@@ -1377,6 +1480,7 @@ def invalidate_source_cache(db: sqlite3.Connection, sources: list[str]) -> int:
             HOME / "Library" / "Application Support" / "Antigravity",
             HOME / "Library" / "Application Support" / "Antigravity IDE",
         ],
+        "grok": [Path(os.environ.get("GROK_HOME") or HOME / ".grok")],
         "cursor": [HOME / ".cursor",
                    HOME / "Library" / "Application Support" / "Cursor"],
         "vscode": [HOME / "Library" / "Application Support" / "Code"],
@@ -1445,6 +1549,8 @@ def cmd_scan(args) -> None:
                 added, notes = scan_gemini(db)
             elif s == "antigravity":
                 added, notes = scan_antigravity(db)
+            elif s == "grok":
+                added, notes = scan_grok(db)
             elif s == "cursor":
                 added, notes = scan_cursor(db)
             elif s == "aider":

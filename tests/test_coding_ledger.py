@@ -158,6 +158,28 @@ class LedgerTestCase(unittest.TestCase):
         con.close()
         self.assertEqual(ledger.antigravity_trajectory_count(state), 2)
 
+    def test_grok_parser_extracts_event_metadata_without_content(self):
+        session = self.root / "events.jsonl"
+        rows = [
+            {"ts": "2026-01-01T12:00:00Z", "type": "turn_started",
+             "session_id": "grok-1", "model_id": "grok-4.5",
+             "session_relationship": "primary", "prompt": "SECRET PROMPT"},
+            {"ts": "2026-01-01T12:00:10Z", "type": "tool_started",
+             "tool_name": "shell", "arguments": "SECRET COMMAND"},
+            {"ts": "2026-01-01T12:03:00Z", "type": "turn_ended",
+             "outcome": "completed", "response": "SECRET RESPONSE"},
+        ]
+        session.write_text("\n".join(json.dumps(row) for row in rows))
+        parsed = ledger.parse_grok_session(session, "widget")
+        self.assertEqual(parsed["session_id"], "grok-1")
+        self.assertEqual(parsed["models"], ["grok-4.5"])
+        self.assertEqual(parsed["user_messages"], 1)
+        self.assertEqual(parsed["tools"], 1)
+        self.assertEqual(parsed["active_s"], 180)
+        serialized = json.dumps(parsed, default=str)
+        self.assertNotIn("SECRET", serialized)
+        self.assertNotIn("shell", serialized)
+
     def test_sessionization_splits_credit_across_midnight(self):
         start = datetime(2026, 1, 1, 23, 59, 30).astimezone()
         end = start + timedelta(minutes=2)
