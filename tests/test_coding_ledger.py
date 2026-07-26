@@ -119,6 +119,20 @@ class LedgerTestCase(unittest.TestCase):
         self.db.commit()
         self.assertEqual(ledger.summarize(self.db)["repositories_with_commits"], 2)
 
+    def test_activity_rhythm_alternates_building_and_off_runs(self):
+        rhythm = ledger.activity_rhythm(
+            ["2026-01-01", "2026-01-02", "2026-01-04",
+             "2026-01-05", "2026-01-06", "2026-01-10"],
+            "2026-01-08")
+        self.assertEqual(rhythm["calendar_days"], 8)
+        self.assertEqual(rhythm["active_days"], 5)
+        self.assertEqual(rhythm["off_days"], 3)
+        self.assertEqual(rhythm["longest_break_days"], 2)
+        self.assertEqual(rhythm["streak_count"], 2)
+        self.assertEqual(
+            [(run["state"], run["days"]) for run in rhythm["runs"]],
+            [("building", 2), ("off", 1), ("building", 3), ("off", 2)])
+
     def test_codex_parser_extracts_metadata_without_transcript_text(self):
         session = self.root / "rollout.jsonl"
         rows = [
@@ -374,6 +388,8 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("Public Builder Scorecard", public)
         self.assertIn("Repositories", public)
         self.assertIn("How the score is evaluated", public)
+        self.assertIn("Building rhythm", public)
+        self.assertIn("on /", public)
         self.assertNotIn("widget", public)
         self.assertNotIn("SECRET", public)
 

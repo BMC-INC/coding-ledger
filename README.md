@@ -120,6 +120,7 @@ Coding Ledger exposes reproducible analytics instead of an opaque productivity s
 - AI leverage as a share of attributed coding time
 - project focus and neutral portfolio-diversity measurement
 - multi-project versus single-project commit and active-hour comparisons
+- alternating building/off-day runs, all-time totals, and longest break
 - verification calls per AI session
 - parallel-agent dispatches
 - session-to-commit conversion within a visible seven-day window

@@ -1287,6 +1287,51 @@ def allocate_coding_hours(own: float, coauthored: float, ai_only: float) -> dict
     }
 
 
+def activity_rhythm(active_day_strings: list[str], report_day: str) -> dict:
+    """Return alternating building/off calendar runs through the report day."""
+    end = datetime.strptime(report_day, "%Y-%m-%d").date()
+    active = {
+        datetime.strptime(day, "%Y-%m-%d").date() for day in active_day_strings}
+    active = {day for day in active if day <= end}
+    if not active:
+        return {
+            "calendar_days": 0, "active_days": 0, "off_days": 0,
+            "longest_break_days": 0, "streak_count": 0, "runs": []}
+    start = min(active)
+    runs: list[dict] = []
+    cursor = start
+    run_start = start
+    building = cursor in active
+    while cursor <= end:
+        state = cursor in active
+        if state != building:
+            runs.append({
+                "state": "building" if building else "off",
+                "start": run_start.isoformat(),
+                "end": (cursor - timedelta(days=1)).isoformat(),
+                "days": (cursor - run_start).days,
+            })
+            run_start = cursor
+            building = state
+        cursor += timedelta(days=1)
+    runs.append({
+        "state": "building" if building else "off",
+        "start": run_start.isoformat(),
+        "end": end.isoformat(),
+        "days": (end - run_start).days + 1,
+    })
+    span = (end - start).days + 1
+    return {
+        "calendar_days": span,
+        "active_days": len(active),
+        "off_days": span - len(active),
+        "longest_break_days": max(
+            (run["days"] for run in runs if run["state"] == "off"), default=0),
+        "streak_count": sum(run["state"] == "building" for run in runs),
+        "runs": runs,
+    }
+
+
 def tier_for(value: float, thresholds: tuple[float, float, float, float]) -> str | None:
     tier = None
     for name, threshold in zip(("bronze", "silver", "gold", "platinum"), thresholds):
@@ -1531,8 +1576,10 @@ def summarize(db: sqlite3.Connection) -> dict:
     trajectory_receipts = sum(
         int((json.loads(row[0]) if row[0] else {}).get("trajectory_receipts", 0))
         for row in db.execute("SELECT meta FROM events WHERE kind='agent_receipts'"))
+    generated_at = datetime.now().astimezone()
+    rhythm = activity_rhythm(days_active, generated_at.date().isoformat())
     return {
-        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "generated_at": generated_at.isoformat(timespec="seconds"),
         "total_hours": rounded_total,
         "raw_total_hours": round(raw_total_hours, 1),
         "overlap_discount_hours": round(overlap_discount_hours, 1),
@@ -1567,6 +1614,7 @@ def summarize(db: sqlite3.Connection) -> dict:
         "active_days": len(days_active),
         "first_activity": first[0], "last_activity": first[1],
         "best_streak": best_streak, "current_streak": cur_streak,
+        "activity_rhythm": rhythm,
         "yearly_hours": {k: round(v, 1) for k, v in sorted(yearly.items())},
         "top_projects": sorted(
             ({"project": p, **{k: round(v, 1) if isinstance(v, float) else v
@@ -1821,6 +1869,12 @@ def cmd_report(args) -> None:
     L.append(f"- AI leverage: **{s['analytics']['ai_leverage_pct']}%** of attributed time")
     L.append(f"- Active days: **{s['active_days']:,}** — current streak "
              f"{s['current_streak']}d, best {s['best_streak']}d")
+    rhythm = s["activity_rhythm"]
+    L.append(f"- Activity rhythm: **{rhythm['active_days']:,} building / "
+             f"{rhythm['off_days']:,} off days** across "
+             f"{rhythm['calendar_days']:,} calendar days; "
+             f"{rhythm['streak_count']:,} building streaks, "
+             f"{rhythm['longest_break_days']:,}d longest break")
     L.append(f"- Span: {(s['first_activity'] or '?')[:10]} → {(s['last_activity'] or '?')[:10]}\n")
     L.append("## Hours by source\n")
     L.append("| Source | Hours | Events |")
@@ -2370,6 +2424,16 @@ def render_dashboard(s: dict, daily: dict) -> str:
       <article class="insight"><div class="eyebrow">Diversity momentum</div>
         <strong>{'+' if commit_change is not None and commit_change >= 0 else ''}{commit_change if commit_change is not None else 'N/A'}{'%' if commit_change is not None else ''}</strong>
         <p>{html.escape(diversity_momentum)}</p></article>"""
+    rhythm = s["activity_rhythm"]
+    rhythm_segments = "".join(
+        f'<span class="run {run["state"]}" style="flex-grow:{run["days"]}" '
+        f'title="{run["start"]} to {run["end"]}: {run["days"]} '
+        f'{"building" if run["state"] == "building" else "off"} days"></span>'
+        for run in rhythm["runs"])
+    recent_runs = rhythm["runs"][-9:]
+    recent_rhythm = " → ".join(
+        f'{run["days"]} {"on" if run["state"] == "building" else "off"}'
+        for run in recent_runs)
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2403,6 +2467,14 @@ grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}} .badge{{disp
 .insights{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}} .insight{{border-top:2px solid var(--ink);padding:15px 2px}}
 .insight strong{{font:800 2.4rem/1 "Iowan Old Style","Palatino Linotype",serif;display:block;margin:10px 0}}
 .insight p{{color:var(--muted);max-width:34ch}}
+.rhythm-stats{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:18px}}
+.rhythm-stat{{border-top:2px solid;padding-top:10px}} .rhythm-stat b{{display:block;font:700 1.8rem "Iowan Old Style",serif}}
+.rhythm-stat span,.rhythm-copy{{font-size:11px;color:var(--muted)}} .rhythm-bar{{display:flex;height:28px;border:1px solid var(--ink);
+background:repeating-linear-gradient(135deg,transparent,transparent 4px,rgba(23,33,29,.08) 4px,rgba(23,33,29,.08) 8px)}}
+.run{{min-width:1px}} .run.building{{background:var(--navy)}} .run.off{{background:transparent}}
+.rhythm-legend{{display:flex;gap:18px;margin:10px 0}} .rhythm-legend span::before{{content:"";display:inline-block;width:11px;height:11px;
+border:1px solid;margin-right:6px;vertical-align:-1px}} .rhythm-legend .on::before{{background:var(--navy)}}
+.rhythm-legend .off::before{{background:repeating-linear-gradient(135deg,transparent,transparent 2px,rgba(23,33,29,.18) 2px,rgba(23,33,29,.18) 4px)}}
 .badge-mark{{width:48px;height:48px;display:grid;place-items:center;border:1px solid var(--ink);border-radius:50%;font-weight:500}}
 .badge h3{{font:600 1.2rem "Iowan Old Style","Palatino Linotype",serif;margin:3px 0 8px}} .badge p,.badge small{{color:var(--muted)}}
 .badge.locked{{opacity:.46;box-shadow:none}} .badge.gold .badge-mark{{background:#e9c46a}} .badge.platinum .badge-mark{{background:var(--acid)}}
@@ -2411,7 +2483,8 @@ table{{width:100%;border-collapse:collapse;table-layout:fixed}} th,td{{padding:8
 th:first-child,td:first-child{{text-align:left}} .method{{font-size:12px;color:var(--muted);max-width:900px}}
 footer{{display:flex;justify-content:space-between;border-top:2px solid var(--ink);padding-top:10px;margin-top:30px}}
 @media(max-width:900px){{main{{padding:16px}}.hero,.two{{grid-template-columns:1fr}}.archetype{{border-left:0;border-top:1px solid;padding:18px 0 0}}
-.metric,.metric.wide{{grid-column:span 12}}.insights{{grid-template-columns:1fr}}h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
+.metric,.metric.wide{{grid-column:span 12}}.insights{{grid-template-columns:1fr}}.rhythm-stats{{grid-template-columns:repeat(2,1fr)}}
+h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
 </style></head><body><main>
 <div class="topline"><span>CODING LEDGER / BUILDER FIELD REPORT</span>
 <span>{html.escape(s['generated_at'])}</span><span class="status">{scan_label.upper()}</span></div>
@@ -2433,6 +2506,15 @@ footer{{display:flex;justify-content:space-between;border-top:2px solid var(--in
 <small>Claude · Codex · Gemini · Grok · Cursor · Aider</small></article>
 </section>
 <article class="panel"><h2>Workflow analytics</h2><div class="insights">{analytics_cards}</div></article>
+<article class="panel"><h2>Building rhythm</h2><div class="rhythm-stats">
+<div class="rhythm-stat"><b>{rhythm['calendar_days']:,}</b><span>calendar days</span></div>
+<div class="rhythm-stat"><b>{rhythm['active_days']:,}</b><span>building days</span></div>
+<div class="rhythm-stat"><b>{rhythm['off_days']:,}</b><span>off days</span></div>
+<div class="rhythm-stat"><b>{rhythm['streak_count']:,}</b><span>building streaks</span></div>
+<div class="rhythm-stat"><b>{rhythm['longest_break_days']:,}d</b><span>longest break</span></div></div>
+<div class="rhythm-bar" role="img" aria-label="{rhythm['active_days']} building days and {rhythm['off_days']} off days from first activity through report day">{rhythm_segments}</div>
+<div class="rhythm-legend"><span class="on">Building</span><span class="off">Off</span></div>
+<p class="rhythm-copy"><b>Recent sequence:</b> {html.escape(recent_rhythm)}</p></article>
 <section class="two"><article class="panel"><h2>Attributed work, over time</h2><div class="chartbox"><canvas id="attr"></canvas></div></article>
 <article class="panel"><h2>Builder dimensions</h2><div class="chartbox"><canvas id="radar"></canvas></div></article></section>
 <article class="panel"><h2>Earned field badges</h2><div class="badges">{badge_cards}</div></article>
@@ -2464,6 +2546,7 @@ options:{{maintainAspectRatio:false,cutout:"62%"}}}});
 def render_public_scorecard(s: dict, builder_name: str) -> str:
     """Render a public-safe scorecard without project or repository names."""
     a = s["analytics"]
+    rhythm = s["activity_rhythm"]
     profile = s["profile"]
     earned = [badge for badge in profile["badges"] if badge["tier"] != "locked"]
     badge_names = " · ".join(badge["name"] for badge in earned[:6]) or "Evidence building"
@@ -2472,6 +2555,9 @@ def render_public_scorecard(s: dict, builder_name: str) -> str:
     momentum_text = (
         f"{'+' if momentum >= 0 else ''}{momentum}%"
         if momentum is not None else "N/A")
+    recent_rhythm = " → ".join(
+        f'{run["days"]} {"on" if run["state"] == "building" else "off"}'
+        for run in rhythm["runs"][-7:])
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2495,7 +2581,9 @@ letter-spacing:-.055em;margin:12px 0 0;text-transform:uppercase}} .identity{{bor
 .score b{{display:block;font:800 clamp(34px,5vw,68px)/1 "Iowan Old Style",serif;margin:9px 0}}
 .score small{{color:#bdc8cc;font-size:10px}} .metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:1.4%;margin-bottom:2.5%}}
 .metric{{border-top:2px solid;padding:2.5% 1%}} .metric b{{font:700 clamp(25px,3vw,42px)/1 "Iowan Old Style",serif;display:block;margin:8px 0}}
-.metric span{{font-size:10px;color:var(--muted)}} .band{{display:grid;grid-template-columns:1fr 1fr;gap:2%;margin-bottom:2.5%}}
+.metric span{{font-size:10px;color:var(--muted)}} .public-rhythm{{display:grid;grid-template-columns:auto 1fr;gap:4%;
+align-items:center;border:1px solid;padding:2%;margin-bottom:2.5%}} .public-rhythm b{{font:700 clamp(20px,2.4vw,32px) "Iowan Old Style",serif;white-space:nowrap}}
+.public-rhythm p{{font-size:10px;line-height:1.5;color:var(--muted);margin:0}} .band{{display:grid;grid-template-columns:1fr 1fr;gap:2%;margin-bottom:2.5%}}
 .panel{{border:1px solid;padding:3%;background:rgba(240,234,219,.88)}} .panel h2{{font:700 clamp(22px,2.5vw,34px)/1 "Iowan Old Style",serif;margin:8px 0 12px}}
 .panel p{{font-size:11px;line-height:1.55;margin:0;color:var(--muted)}} .badges{{border-top:1px solid var(--rule);padding-top:2%;font-size:10px}}
 .method{{margin-top:auto;border-top:2px solid;padding-top:2%;display:grid;grid-template-columns:1fr 2.2fr;gap:4%}}
@@ -2515,6 +2603,9 @@ letter-spacing:-.055em;margin:12px 0 0;text-transform:uppercase}} .identity{{bor
 <div class="metric"><div class="label">Repositories</div><b>{s['repositories_with_commits']:,}</b><span>with matched commits</span></div>
 <div class="metric"><div class="label">AI sessions</div><b>{s['sessions']:,}</b><span>metadata-only evidence</span></div>
 <div class="metric"><div class="label">Session → commit</div><b>{a['session_commit_conversion_pct']}%</b><span>within seven days</span></div></section>
+<section class="public-rhythm"><b>{rhythm['active_days']:,} on / {rhythm['off_days']:,} off</b>
+<p><span class="label">Building rhythm across {rhythm['calendar_days']:,} calendar days</span><br>
+{rhythm['streak_count']:,} building streaks · {rhythm['longest_break_days']:,}d longest break · recent: {html.escape(recent_rhythm)}</p></section>
 <section class="band"><article class="panel"><div class="label">Portfolio breadth</div><h2>{a['project_diversity_pct']}% project diversity</h2>
 <p>Neutral inverse-concentration measure across {a['active_projects']:,} active project identities. Diversity momentum: {momentum_text} commits on multi-project workflow days.</p></article>
 <article class="panel"><div class="label">Verification and direction</div><h2>{a['verification_per_session']} test calls / session</h2>
