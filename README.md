@@ -14,6 +14,9 @@ self-contained and works offline.
 | Git | Author-filtered commits, SHA, timestamp, numstat, co-author trailers | Daily density proxy |
 | Claude Code | `~/.claude/projects/**/*.jsonl` metadata | Sessionized active time |
 | Codex | `~/.codex/sessions/**/*.jsonl` metadata | Sessionized and attributed time |
+| Gemini | `~/.gemini/tmp/*/chats/session-*.json[l]` metadata | Sessionized and attributed time |
+| Antigravity | Local edit history plus opaque trajectory counts | Capped edit proxy |
+| Grok Build | `$GROK_HOME/sessions/**/events.jsonl` metadata | Sessionized and attributed time |
 | Cursor | Agent transcripts, chat timestamps, local history | Sessionized active time |
 | Aider | `.aider.chat.history.md` timestamps | Sessionized active time |
 | VS Code | Local History edit timestamps | Capped edit proxy |
@@ -99,6 +102,21 @@ Current time heuristics:
 - VS Code: two minutes per history edit, capped at 90 minutes per day.
 - GitHub: commits and LOC only; zero hours.
 
+## Workflow analytics
+
+Coding Ledger exposes reproducible analytics instead of an opaque productivity score:
+
+- AI leverage as a share of attributed coding time
+- project focus and portfolio fragmentation
+- verification calls per AI session
+- parallel-agent dispatches
+- session-to-commit conversion within a visible seven-day window
+- median session-to-commit lag for project-matchable receipts
+
+Activity is measured. Performance is evidenced through outcomes such as commits,
+tests, and sustained delivery. The tool does not claim that hours alone establish
+quality or business impact.
+
 ## Builder profile and badges
 
 The dashboard is an offline builder field report with five reproducible dimensions:
@@ -155,8 +173,16 @@ ends as `running`, `complete`, or `interrupted`.
 Per-repository and per-session commits preserve already imported events after an
 interruption. Git timeouts are recorded with exact repository paths.
 
-Use `scan --sources claude,codex --reprocess-sessions` after changing attribution
+Use `scan --sources claude,codex,gemini,grok --reprocess-sessions` after changing attribution
 rules; it invalidates only the selected source caches and upserts the same stable events.
+
+## Open-core direction
+
+The scanner, SQLite ledger, reports, analytics, and generated local site are open and
+unlocked. The first product use case is an individual builder portfolio that proves
+how someone builds without exposing what they build. Potential hosted verification
+or team features are intentionally deferred until real usage establishes which
+workflows users value.
 
 ## Commands
 
@@ -165,7 +191,7 @@ init              Initialize metadata and author identities
 scan              Scan selected sources and explicit roots
 status            Show terminal totals, attribution, and scan state
 report            Produce Markdown or JSON
-dashboard         Generate the offline HTML field report
+dashboard         Generate the offline landing page and HTML field report
 doctor            Show discoverable sources, including Codex
 sync-github       Maintain lightweight no-checkout GitHub history
 install-daemon    Install the macOS daily scan

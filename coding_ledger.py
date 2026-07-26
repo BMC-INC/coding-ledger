@@ -56,6 +56,7 @@ HOME = Path.home()
 LEDGER_DIR = Path(os.environ.get("CODING_LEDGER_DIR", HOME / ".coding-ledger"))
 DEFAULT_DB = Path(os.environ.get("CODING_LEDGER_DB", LEDGER_DIR / "ledger.db"))
 DASHBOARD_PATH = LEDGER_DIR / "dashboard.html"
+LANDING_PATH = LEDGER_DIR / "index.html"
 
 ALL_SOURCES = [
     "git", "claude", "codex", "gemini", "antigravity", "grok",
@@ -1195,6 +1196,8 @@ def compute_daily(db: sqlite3.Connection) -> dict:
 
     def bump_proj(p: str | None, h: float = 0, a: int = 0, d: int = 0):
         p = p or "misc"
+        if p in {"-Users-kingjames", "Users-kingjames"}:
+            p = "Unattributed workspace"
         e = proj.setdefault(p, {"hours": 0.0, "loc_add": 0, "loc_del": 0})
         e["hours"] += h
         e["loc_add"] += a
@@ -1366,7 +1369,8 @@ def builder_profile(db: sqlite3.Connection, agg: dict, evidence_hours: dict[str,
 def workflow_analytics(db: sqlite3.Connection, agg: dict, total_hours: float,
                        ai_hours: float, profile: dict) -> dict:
     project_hours = sorted(
-        (entry["hours"] for entry in agg["projects"].values() if entry["hours"] > 0),
+        (entry["hours"] for project, entry in agg["projects"].items()
+         if entry["hours"] > 0 and project not in {"misc", "Unattributed workspace"}),
         reverse=True)
     project_total = sum(project_hours)
     focus_pct = 100 * project_hours[0] / project_total if project_total else 0.0
@@ -1807,8 +1811,11 @@ def cmd_dashboard(args) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html)
     say(f"{C_GREEN}✓ dashboard written{C_RESET} to {out}")
+    landing_out = out.parent / "index.html"
+    landing_out.write_text(render_landing(s))
+    say(f"{C_GREEN}✓ landing page written{C_RESET} to {landing_out}")
     if args.open:
-        subprocess.run(["open", str(out)], check=False)
+        subprocess.run(["open", str(landing_out)], check=False)
 
 
 def cmd_doctor(args) -> None:
@@ -2018,6 +2025,101 @@ new Chart(document.getElementById("loc"), {{ type:"line",
 """
 
 
+def render_landing(s: dict) -> str:
+    """Render the local product landing page without exposing project details."""
+    analytics = s["analytics"]
+    source_names = {
+        "git": "Git", "claude": "Claude Code", "codex": "Codex",
+        "gemini": "Gemini", "antigravity": "Antigravity", "grok": "Grok Build",
+        "cursor": "Cursor", "aider": "Aider", "vscode": "VS Code",
+        "github": "GitHub",
+    }
+    source_chips = "".join(
+        f"<span>{html.escape(source_names[source])}</span>" for source in ALL_SOURCES)
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Coding Ledger — Prove how you build</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23d7ff52'/%3E%3Cpath d='M18 18h28v7H25v14h21v7H18z' fill='%23131c18'/%3E%3C/svg%3E">
+<style>
+:root{{--ink:#131c18;--paper:#f4f0e5;--acid:#d7ff52;--orange:#ff6b3d;--blue:#18344c;--muted:#68716b}}
+*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;background:var(--paper);color:var(--ink);
+font:15px/1.6 "SFMono-Regular","Cascadia Mono","Liberation Mono",monospace}}
+a{{color:inherit}}.wrap{{max-width:1240px;margin:auto;padding:0 28px}}nav{{height:78px;display:flex;align-items:center;
+justify-content:space-between;border-bottom:1px solid var(--ink)}}.brand{{font-weight:900;letter-spacing:-.05em;font-size:1.2rem}}
+.navlinks{{display:flex;gap:24px;align-items:center}}.navlinks a{{text-decoration:none}}.button{{display:inline-block;background:var(--acid);
+border:1px solid var(--ink);box-shadow:4px 4px 0 var(--ink);padding:11px 16px;text-decoration:none;font-weight:800}}
+.button.dark{{background:var(--ink);color:white}}.hero{{min-height:720px;display:grid;grid-template-columns:1.45fr .8fr;
+gap:70px;align-items:center;padding:90px 0}}.kicker{{text-transform:uppercase;letter-spacing:.17em;font-size:11px}}
+h1,h2,h3,p{{margin-top:0}}h1,h2,h3{{font-family:"Iowan Old Style","Palatino Linotype",serif}}h1{{font-size:clamp(4rem,8vw,8rem);
+line-height:.82;letter-spacing:-.07em;margin:28px 0}}h1 em{{font-style:normal;color:var(--orange)}}.lede{{font-size:1.1rem;
+max-width:660px;color:#44504a}}.actions{{display:flex;gap:14px;margin-top:32px;flex-wrap:wrap}}.proof{{background:var(--blue);
+color:white;padding:28px;border:1px solid var(--ink);box-shadow:10px 10px 0 var(--acid);transform:rotate(1deg)}}
+.proof .big{{font:900 5.5rem/.9 "Iowan Old Style","Palatino Linotype",serif;letter-spacing:-.06em;margin:22px 0}}
+.proof dl{{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:26px 0 0}}.proof dt{{color:#aebdc5;font-size:11px;
+text-transform:uppercase;letter-spacing:.1em}}.proof dd{{margin:3px 0;font-size:1.25rem;font-weight:800}}section.block{{padding:90px 0;
+border-top:2px solid var(--ink)}}.section-head{{display:grid;grid-template-columns:1fr 1fr;gap:60px;margin-bottom:40px}}
+h2{{font-size:clamp(2.5rem,5vw,5rem);line-height:.92;letter-spacing:-.05em}}.grid3{{display:grid;grid-template-columns:repeat(3,1fr);
+gap:16px}}.card{{border:1px solid var(--ink);padding:24px;min-height:250px;background:#faf7ef;box-shadow:5px 5px 0 var(--ink)}}
+.card b{{display:block;font:800 2rem/1 "Iowan Old Style","Palatino Linotype",serif;margin:20px 0}}.card p,.section-copy{{color:var(--muted)}}
+.sources{{display:flex;flex-wrap:wrap;gap:9px}}.sources span{{border:1px solid var(--ink);padding:8px 11px;background:#fff}}
+.privacy{{background:var(--ink);color:white}}.privacy .section-copy{{color:#b9c4bf}}.rule-list{{list-style:none;padding:0;margin:0;
+display:grid;grid-template-columns:1fr 1fr;gap:10px}}.rule-list li{{border-top:1px solid #607068;padding:14px 0}}
+.rule-list li::before{{content:"✓";color:var(--acid);margin-right:10px}}.closing{{text-align:center;padding:110px 0}}.closing h2{{max-width:900px;
+margin:0 auto 30px}}footer{{border-top:1px solid var(--ink);padding:24px 0;display:flex;justify-content:space-between;color:var(--muted)}}
+@media(max-width:800px){{.wrap{{padding:0 17px}}.navlinks a:not(.button){{display:none}}.hero,.section-head{{grid-template-columns:1fr}}
+.hero{{padding:65px 0;gap:45px}}.grid3{{grid-template-columns:1fr}}.rule-list{{grid-template-columns:1fr}}h1{{font-size:4rem}}
+.proof .big{{font-size:4rem}}footer{{gap:20px;flex-direction:column}}}}
+</style></head><body>
+<div class="wrap"><nav><div class="brand">CODING LEDGER</div><div class="navlinks">
+<a href="#use-cases">Use cases</a><a href="#evidence">Evidence</a><a href="#privacy">Privacy</a>
+<a class="button" href="dashboard.html">Open report →</a></div></nav>
+<main><section class="hero"><div><div class="kicker">Local-first development intelligence</div>
+<h1>Prove how<br>you <em>build.</em></h1>
+<p class="lede">Turn Git history, coding-agent sessions, and editor activity into a transparent,
+auditable account of your work—without uploading prompts, source code, secrets, or tool output.</p>
+<div class="actions"><a class="button" href="dashboard.html">Open the field report →</a>
+<a class="button dark" href="#evidence">See how it works</a></div></div>
+<aside class="proof"><div class="kicker">Live local ledger</div><div class="big">{s['total_hours']:,}h</div>
+<p>Deduplicated, overlap-discounted development evidence.</p><dl>
+<div><dt>Commits</dt><dd>{s['total_commits']:,}</dd></div>
+<div><dt>AI sessions</dt><dd>{s['sessions']:,}</dd></div>
+<div><dt>AI leverage</dt><dd>{analytics['ai_leverage_pct']}%</dd></div>
+<div><dt>Active days</dt><dd>{s['active_days']:,}</dd></div></dl></aside></section>
+
+<section class="block" id="use-cases"><div class="section-head"><h2>Receipts over assurances.</h2>
+<p class="section-copy">Coding Ledger is built for people and teams that want evidence of sustained
+building, effective AI adoption, verification habits, and delivery—not a hidden productivity score.</p></div>
+<div class="grid3"><article class="card"><div class="kicker">01 / Builders</div><b>A verified portfolio</b>
+<p>Show how you work across projects, tools, and time without publishing private repositories.</p></article>
+<article class="card"><div class="kicker">02 / Applicants</div><b>Evidence for diligence</b>
+<p>Give accelerators, investors, and clients a transparent view of cadence, focus, and shipping behavior.</p></article>
+<article class="card"><div class="kicker">03 / Teams</div><b>AI adoption that is measurable</b>
+<p>Understand tool usage, agent leverage, testing loops, and delivery conversion with explicit formulas.</p></article></div></section>
+
+<section class="block" id="evidence"><div class="section-head"><h2>One ledger.<br>Every workflow.</h2>
+<div><p class="section-copy">Adapters normalize local metadata into reproducible events. Growing sessions
+are replaced idempotently and interrupted scans remain explicitly labeled.</p><div class="sources">{source_chips}</div></div></div>
+<div class="grid3"><article class="card"><div class="kicker">Attribution</div><b>Your Coding / AI Coding</b>
+<p>Shared work is allocated using the measured ratio of human-only and AI-only base evidence.</p></article>
+<article class="card"><div class="kicker">Performance evidence</div><b>{analytics['session_commit_conversion_pct']}% conversion</b>
+<p>Project-matchable agent sessions followed by a commit within seven days. Correlation, not a quality claim.</p></article>
+<article class="card"><div class="kicker">Portfolio signal</div><b>{analytics['top_project_focus_pct']}% top focus</b>
+<p>See concentration, fragmentation, active projects, streaks, and sustained delivery over time.</p></article></div></section>
+
+<section class="block privacy" id="privacy"><div class="section-head"><h2>Private by architecture.</h2>
+<p class="section-copy">The free core runs locally with Python and SQLite. Raw work stays on the machine;
+the generated report works offline.</p></div><ul class="rule-list"><li>No prompt bodies</li><li>No assistant responses</li>
+<li>No source-code storage</li><li>No tool arguments or output</li><li>No credentials or environment values</li>
+<li>No model-generated personality judgment</li></ul></section>
+
+<section class="closing"><div class="kicker">The builder field report</div>
+<h2>Activity is measured.<br>Performance is evidenced through outcomes.</h2>
+<a class="button" href="dashboard.html">Open the field report →</a></section></main>
+<footer><span>CODING LEDGER / OPEN CORE</span><span>ALL DATA LOCAL · GENERATED {html.escape(s['generated_at'][:10])}</span></footer>
+</div></body></html>"""
+
+
 def render_dashboard(s: dict, daily: dict) -> str:
     """Render an offline, evidence-first builder field report."""
     days = sorted(daily["hours"])
@@ -2100,7 +2202,7 @@ def render_dashboard(s: dict, daily: dict) -> str:
 --red:#e76f51;--green:#2a9d8f;--navy:#16324f;--panel:#e6dfce}}
 *{{box-sizing:border-box}} body{{margin:0;background:var(--paper);color:var(--ink);
 font:14px/1.55 "SFMono-Regular","Cascadia Mono","Liberation Mono",monospace;background-image:linear-gradient(rgba(23,33,29,.045) 1px,transparent 1px);
-background-size:100% 28px}} main{{max-width:1480px;margin:auto;padding:28px}}
+background-size:100% 28px}} main{{max-width:1480px;margin:auto;padding:28px;overflow:hidden}}
 h1,h2,h3,p{{margin:0}} h1,h2{{font-family:"Iowan Old Style","Palatino Linotype",Palatino,serif}} h1{{font-size:clamp(3.4rem,9vw,9rem);
 line-height:.79;letter-spacing:-.06em;max-width:1050px}} .topline{{display:flex;justify-content:space-between;
 border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);padding:8px 0;margin-bottom:34px}}
@@ -2109,13 +2211,14 @@ padding:2px 8px;border:1px solid var(--ink)}} .hero{{display:grid;grid-template-
 align-items:end;border-bottom:3px solid var(--ink);padding-bottom:30px}} .archetype{{border-left:1px solid var(--ink);padding-left:24px}}
 .archetype strong{{font:800 2.2rem/1 "Iowan Old Style","Palatino Linotype",serif;display:block;margin:8px 0 12px}}
 .ledger-grid{{display:grid;grid-template-columns:repeat(12,1fr);gap:14px;margin:18px 0}}
-.metric,.panel,.badge{{border:1px solid var(--ink);background:rgba(240,234,219,.9);box-shadow:4px 4px 0 var(--ink)}}
+.metric,.panel,.badge{{border:1px solid var(--ink);background:rgba(240,234,219,.9);box-shadow:4px 4px 0 var(--ink);min-width:0}}
 .metric{{grid-column:span 3;padding:18px;min-height:145px;position:relative;overflow:hidden}}
 .metric.wide{{grid-column:span 6;background:var(--navy);color:#fff}} .metric .number{{font:800 clamp(2.2rem,5vw,5rem)/1 "Iowan Old Style","Palatino Linotype",serif;
 letter-spacing:-.05em;margin:12px 0}} .metric small{{color:var(--muted)}} .metric.wide small{{color:#b9c4c8}}
 .duo{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:18px}} .duo div{{border-top:1px solid #80909a;padding-top:9px}}
 .duo b{{font-size:1.3rem;display:block}} .panel{{padding:20px;margin-bottom:16px}} .panel h2{{font-size:1.6rem;margin-bottom:16px}}
-.two{{display:grid;grid-template-columns:1.35fr 1fr;gap:16px}} .chartbox{{height:320px}} .badges{{display:grid;
+.two{{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);gap:16px}} .chartbox{{height:320px;min-width:0;max-width:100%}}
+.chartbox canvas{{max-width:100%!important}} .badges{{display:grid;
 grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}} .badge{{display:flex;gap:15px;padding:15px;min-height:130px}}
 .insights{{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}} .insight{{border-top:2px solid var(--ink);padding:15px 2px}}
 .insight strong{{font:800 2.4rem/1 "Iowan Old Style","Palatino Linotype",serif;display:block;margin:10px 0}}
@@ -2124,7 +2227,7 @@ grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}} .badge{{disp
 .badge h3{{font:600 1.2rem "Iowan Old Style","Palatino Linotype",serif;margin:3px 0 8px}} .badge p,.badge small{{color:var(--muted)}}
 .badge.locked{{opacity:.46;box-shadow:none}} .badge.gold .badge-mark{{background:#e9c46a}} .badge.platinum .badge-mark{{background:var(--acid)}}
 .badge.silver .badge-mark{{background:#d4d8d5}} .badge.bronze .badge-mark{{background:#c88b62}}
-table{{width:100%;border-collapse:collapse}} th,td{{padding:8px;border-bottom:1px solid var(--rule);text-align:right}}
+table{{width:100%;border-collapse:collapse;table-layout:fixed}} th,td{{padding:8px;border-bottom:1px solid var(--rule);text-align:right;overflow-wrap:anywhere}}
 th:first-child,td:first-child{{text-align:left}} .method{{font-size:12px;color:var(--muted);max-width:900px}}
 footer{{display:flex;justify-content:space-between;border-top:2px solid var(--ink);padding-top:10px;margin-top:30px}}
 @media(max-width:900px){{main{{padding:16px}}.hero,.two{{grid-template-columns:1fr}}.archetype{{border-left:0;border-top:1px solid;padding:18px 0 0}}

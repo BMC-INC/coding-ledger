@@ -307,6 +307,12 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("Workflow analytics", rendered)
         self.assertIn("Session → commit", rendered)
         self.assertNotIn("SECRET", rendered)
+        landing = ledger.render_landing(summary)
+        self.assertIn("Prove how you build", landing)
+        self.assertIn("Open the field report", landing)
+        self.assertIn("Gemini", landing)
+        self.assertIn("Grok Build", landing)
+        self.assertNotIn("SECRET", landing)
 
 
 if __name__ == "__main__":
