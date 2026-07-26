@@ -107,7 +107,8 @@ Current time heuristics:
 Coding Ledger exposes reproducible analytics instead of an opaque productivity score:
 
 - AI leverage as a share of attributed coding time
-- project focus and portfolio fragmentation
+- project focus and neutral portfolio-diversity measurement
+- multi-project versus single-project commit and active-hour comparisons
 - verification calls per AI session
 - parallel-agent dispatches
 - session-to-commit conversion within a visible seven-day window
@@ -115,7 +116,10 @@ Coding Ledger exposes reproducible analytics instead of an opaque productivity s
 
 Activity is measured. Performance is evidenced through outcomes such as commits,
 tests, and sustained delivery. The tool does not claim that hours alone establish
-quality or business impact.
+quality or business impact. Project diversity is not scored as inherently good or
+bad; the accompanying cohort comparison shows whether broader workdays coincide
+with stronger or weaker momentum for that builder. Cohorts are assigned from
+session and editor receipts, while commits are measured separately as the outcome.
 
 ## Builder profile and badges
 

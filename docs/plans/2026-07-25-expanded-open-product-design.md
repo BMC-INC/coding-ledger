@@ -50,7 +50,8 @@ The expanded report adds transparent, reproducible analytics:
 
 - Your Coding versus AI Coding and AI leverage over time
 - project portfolio by hours, commits, sessions, and active days
-- project focus and fragmentation
+- project focus and neutrally labeled portfolio diversity
+- multi-project versus single-project momentum comparisons
 - tool and agent mix
 - verification-loop density
 - session-to-commit conversion and lag where timestamps support matching

@@ -306,6 +306,9 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("Builder dimensions", rendered)
         self.assertIn("Workflow analytics", rendered)
         self.assertIn("Session → commit", rendered)
+        self.assertIn("Project diversity", rendered)
+        self.assertIn("Diversity momentum", rendered)
+        self.assertNotIn("Fragmentation", rendered)
         self.assertNotIn("SECRET", rendered)
         landing = ledger.render_landing(summary)
         self.assertIn("Prove how you build", landing)
@@ -313,6 +316,30 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("Gemini", landing)
         self.assertIn("Grok Build", landing)
         self.assertNotIn("SECRET", landing)
+
+    def test_project_diversity_compares_multi_project_momentum(self):
+        start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        for offset, project in ((0, "alpha"), (24, "alpha"), (25, "beta")):
+            ts = start + timedelta(hours=offset)
+            ledger.insert_event(
+                self.db, f"session:{offset}", "codex", "session", ts,
+                ts + timedelta(minutes=1), project,
+                meta={"active_s": 60, "days": {ledger.local_day(ts): 60}})
+        for offset, project in ((0, "alpha"), (1, "alpha"), (24, "alpha"),
+                                (25, "beta"), (26, "beta")):
+            ts = start + timedelta(hours=offset)
+            ledger.insert_event(
+                self.db, f"commit:{offset}", "git", "commit", ts, ts,
+                project, items=1)
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        analytics = summary["analytics"]
+        self.assertEqual(analytics["single_project_days"], 1)
+        self.assertEqual(analytics["multi_project_days"], 1)
+        self.assertEqual(analytics["single_project_commits_per_day"], 2)
+        self.assertEqual(analytics["multi_project_commits_per_day"], 3)
+        self.assertEqual(analytics["multi_project_commit_change_pct"], 50)
+        self.assertGreater(analytics["project_diversity_pct"], 0)
 
 
 if __name__ == "__main__":

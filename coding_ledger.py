@@ -1374,10 +1374,44 @@ def workflow_analytics(db: sqlite3.Connection, agg: dict, total_hours: float,
         reverse=True)
     project_total = sum(project_hours)
     focus_pct = 100 * project_hours[0] / project_total if project_total else 0.0
-    fragmentation = 0.0
+    project_diversity = 0.0
     if project_total:
-        fragmentation = 100 * (1 - sum((hours / project_total) ** 2
-                                        for hours in project_hours))
+        project_diversity = 100 * (1 - sum((hours / project_total) ** 2
+                                           for hours in project_hours))
+
+    projects_by_day: dict[str, set[str]] = {}
+    for ts_start, project in db.execute(
+            "SELECT ts_start,project FROM events "
+            "WHERE kind IN ('session','edit')"):
+        ts = parse_iso(ts_start)
+        normalized_project = project or "misc"
+        if not ts or normalized_project in {
+                "misc", "Unattributed workspace", "-Users-kingjames",
+                "Users-kingjames"}:
+            continue
+        projects_by_day.setdefault(local_day(ts), set()).add(normalized_project)
+    single_project_days = [
+        day for day, projects in projects_by_day.items() if len(projects) == 1]
+    multi_project_days = [
+        day for day, projects in projects_by_day.items() if len(projects) >= 2]
+
+    def cohort_average(days: list[str], daily_values: dict[str, float | int]) -> float:
+        return statistics.mean(float(daily_values.get(day, 0)) for day in days) \
+            if days else 0.0
+
+    single_commits = cohort_average(single_project_days, agg["commits"])
+    multi_commits = cohort_average(multi_project_days, agg["commits"])
+    single_hours = cohort_average(
+        single_project_days,
+        {day: sum(per_source.values()) for day, per_source in agg["hours"].items()})
+    multi_hours = cohort_average(
+        multi_project_days,
+        {day: sum(per_source.values()) for day, per_source in agg["hours"].items()})
+
+    def percent_change(comparison: float, baseline: float) -> float | None:
+        if not baseline:
+            return None
+        return round(100 * (comparison - baseline) / baseline, 1)
 
     commits_by_project: dict[str, list[datetime]] = {}
     for project, ts_start in db.execute(
@@ -1410,7 +1444,15 @@ def workflow_analytics(db: sqlite3.Connection, agg: dict, total_hours: float,
         "ai_leverage_pct": round(100 * ai_hours / total_hours, 1) if total_hours else 0.0,
         "active_projects": len(project_hours),
         "top_project_focus_pct": round(focus_pct, 1),
-        "fragmentation_pct": round(fragmentation, 1),
+        "project_diversity_pct": round(project_diversity, 1),
+        "single_project_days": len(single_project_days),
+        "multi_project_days": len(multi_project_days),
+        "single_project_commits_per_day": round(single_commits, 2),
+        "multi_project_commits_per_day": round(multi_commits, 2),
+        "multi_project_commit_change_pct": percent_change(multi_commits, single_commits),
+        "single_project_hours_per_day": round(single_hours, 2),
+        "multi_project_hours_per_day": round(multi_hours, 2),
+        "multi_project_hours_change_pct": percent_change(multi_hours, single_hours),
         "verification_calls": metrics["test_calls"],
         "verification_per_session": round(
             metrics["test_calls"] / sessions, 2) if sessions else 0.0,
@@ -1780,7 +1822,12 @@ def cmd_report(args) -> None:
     L.append("\n## Workflow analytics\n")
     L.append(f"- Top-project focus: **{a['top_project_focus_pct']}%** across "
              f"**{a['active_projects']:,}** projects")
-    L.append(f"- Project fragmentation index: **{a['fragmentation_pct']}%**")
+    L.append(f"- Project diversity index: **{a['project_diversity_pct']}%**")
+    if a["multi_project_commit_change_pct"] is not None:
+        direction = "more" if a["multi_project_commit_change_pct"] >= 0 else "fewer"
+        L.append(f"- Multi-project days average **{abs(a['multi_project_commit_change_pct']):.1f}% "
+                 f"{direction} commits** than single-project days "
+                 f"({a['multi_project_days']} vs {a['single_project_days']} days)")
     L.append(f"- Verification density: **{a['verification_per_session']}** detected "
              f"test calls per AI session")
     L.append(f"- Parallel-agent dispatches: **{a['parallel_dispatches']:,}**")
@@ -2105,7 +2152,7 @@ are replaced idempotently and interrupted scans remain explicitly labeled.</p><d
 <article class="card"><div class="kicker">Performance evidence</div><b>{analytics['session_commit_conversion_pct']}% conversion</b>
 <p>Project-matchable agent sessions followed by a commit within seven days. Correlation, not a quality claim.</p></article>
 <article class="card"><div class="kicker">Portfolio signal</div><b>{analytics['top_project_focus_pct']}% top focus</b>
-<p>See concentration, fragmentation, active projects, streaks, and sustained delivery over time.</p></article></div></section>
+<p>See project diversity, concentration, active projects, streaks, and sustained delivery over time.</p></article></div></section>
 
 <section class="block privacy" id="privacy"><div class="section-head"><h2>Private by architecture.</h2>
 <p class="section-copy">The free core runs locally with Python and SQLite. Raw work stays on the machine;
@@ -2172,6 +2219,17 @@ def render_dashboard(s: dict, daily: dict) -> str:
     lag = (f"{analytics['median_session_to_commit_hours']:,}h median lag"
            if analytics["median_session_to_commit_hours"] is not None
            else "lag unavailable")
+    commit_change = analytics["multi_project_commit_change_pct"]
+    if commit_change is None:
+        diversity_momentum = "Not enough single-project history for a comparison."
+    else:
+        direction = "more" if commit_change >= 0 else "fewer"
+        diversity_momentum = (
+            f"Multi-project workflow days average {analytics['multi_project_commits_per_day']:.2f} "
+            f"commits versus {analytics['single_project_commits_per_day']:.2f} on single-project "
+            f"days—{abs(commit_change):.1f}% {direction} "
+            f"({analytics['multi_project_days']:,} vs "
+            f"{analytics['single_project_days']:,} days).")
     analytics_cards = f"""
       <article class="insight"><div class="eyebrow">AI leverage</div>
         <strong>{analytics['ai_leverage_pct']}%</strong>
@@ -2188,9 +2246,12 @@ def render_dashboard(s: dict, daily: dict) -> str:
       <article class="insight"><div class="eyebrow">Parallel work</div>
         <strong>{analytics['parallel_dispatches']:,}</strong>
         <p>Evidence-backed agent and subagent dispatches.</p></article>
-      <article class="insight"><div class="eyebrow">Fragmentation</div>
-        <strong>{analytics['fragmentation_pct']}%</strong>
-        <p>Portfolio dispersion using the inverse Herfindahl concentration index.</p></article>"""
+      <article class="insight"><div class="eyebrow">Project diversity</div>
+        <strong>{analytics['project_diversity_pct']}%</strong>
+        <p>Expansive portfolio breadth using an inverse concentration index. Neutral by design.</p></article>
+      <article class="insight"><div class="eyebrow">Diversity momentum</div>
+        <strong>{'+' if commit_change is not None and commit_change >= 0 else ''}{commit_change if commit_change is not None else 'N/A'}{'%' if commit_change is not None else ''}</strong>
+        <p>{html.escape(diversity_momentum)}</p></article>"""
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
