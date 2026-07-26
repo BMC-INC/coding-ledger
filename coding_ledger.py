@@ -964,7 +964,7 @@ def tier_for(value: float, thresholds: tuple[float, float, float, float]) -> str
     return tier
 
 
-def builder_profile(db: sqlite3.Connection, agg: dict, attributed_hours: dict[str, float]) -> dict:
+def builder_profile(db: sqlite3.Connection, agg: dict, evidence_hours: dict[str, float]) -> dict:
     metrics = {
         "sessions": 0, "tools": 0, "user_messages": 0, "test_calls": 0,
         "parallel_calls": 0, "plan_turns": 0, "turns": 0, "ai_coauthored_commits": 0,
@@ -994,8 +994,8 @@ def builder_profile(db: sqlite3.Connection, agg: dict, attributed_hours: dict[st
     plan_rate = metrics["plan_turns"] / max(metrics["turns"], 1)
     tests_per_session = metrics["test_calls"] / sessions
     commits_per_day = commits / active_days
-    ai_total = attributed_hours.get("coauthored", 0) + attributed_hours.get("ai_only", 0)
-    autonomy_rate = attributed_hours.get("ai_only", 0) / max(ai_total, 0.001)
+    ai_total = evidence_hours.get("coauthored", 0) + evidence_hours.get("ai_only", 0)
+    autonomy_rate = evidence_hours.get("ai_only", 0) / max(ai_total, 0.001)
     night_rate = late / max(timed, 1)
     dimensions = {
         "steering": min(100, round(user_per_session * 18 + min(tools_per_session, 10) * 3)),
@@ -1050,11 +1050,19 @@ def summarize(db: sqlite3.Connection) -> dict:
         for s, h in per.items():
             total_by_source[s] = total_by_source.get(s, 0.0) + h
     raw_total_hours = sum(total_by_source.values())
-    attributed_hours = {"own": 0.0, "coauthored": 0.0, "ai_only": 0.0}
+    evidence_hours = {"own": 0.0, "coauthored": 0.0, "ai_only": 0.0}
     for per in agg["attributed"].values():
-        for key in attributed_hours:
-            attributed_hours[key] += per.get(key, 0.0)
-    total_hours = sum(attributed_hours.values())
+        for key in evidence_hours:
+            evidence_hours[key] += per.get(key, 0.0)
+    allocation = allocate_coding_hours(
+        evidence_hours["own"], evidence_hours["coauthored"], evidence_hours["ai_only"])
+    total_hours = allocation["your_coding"] + allocation["ai_coding"]
+    rounded_total = round(total_hours, 1)
+    rounded_your = round(allocation["your_coding"], 1)
+    attributed_hours = {
+        "your_coding": rounded_your,
+        "ai_coding": round(rounded_total - rounded_your, 1),
+    }
 
     rows = db.execute("SELECT source, COUNT(*), SUM(loc_add), SUM(loc_del), SUM(items) "
                       "FROM events GROUP BY source").fetchall()
@@ -1082,12 +1090,19 @@ def summarize(db: sqlite3.Connection) -> dict:
     for day, per in hours.items():
         yearly[day[:4]] = yearly.get(day[:4], 0.0) + sum(per.values())
 
-    profile = builder_profile(db, agg, attributed_hours)
+    profile = builder_profile(db, agg, evidence_hours)
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "total_hours": round(total_hours, 1),
+        "total_hours": rounded_total,
         "raw_total_hours": round(raw_total_hours, 1),
-        "attributed_hours": {k: round(v, 1) for k, v in attributed_hours.items()},
+        "attributed_hours": attributed_hours,
+        "coauthor_allocation": {
+            "shared_hours": round(evidence_hours["coauthored"], 1),
+            "your_base_hours": round(evidence_hours["own"], 1),
+            "ai_base_hours": round(evidence_hours["ai_only"], 1),
+            "your_share_pct": round(allocation["your_share"] * 100, 2),
+            "ai_share_pct": round(allocation["ai_share"] * 100, 2),
+        },
         "target_hours": TARGET_HOURS,
         "pct_to_target": round(100 * total_hours / TARGET_HOURS, 2),
         "remaining_hours": round(max(TARGET_HOURS - total_hours, 0), 1),
@@ -1278,9 +1293,11 @@ def cmd_status(args) -> None:
         f"({s['pct_to_target']}%)")
     if provisional:
         say(f"  {C_YELLOW}PROVISIONAL — no complete all-source baseline is recorded{C_RESET}")
-    say(f"  attributed: own {fmt_h(s['attributed_hours']['own'])} · "
-        f"co-authored {fmt_h(s['attributed_hours']['coauthored'])} · "
-        f"AI-only {fmt_h(s['attributed_hours']['ai_only'])}")
+    say(f"  coding: yours {fmt_h(s['attributed_hours']['your_coding'])} · "
+        f"AI {fmt_h(s['attributed_hours']['ai_coding'])}")
+    allocation = s["coauthor_allocation"]
+    say(f"  shared evidence: {fmt_h(allocation['shared_hours'])} allocated "
+        f"{allocation['your_share_pct']}% yours / {allocation['ai_share_pct']}% AI")
     say(f"  raw source sum before overlap discount: {fmt_h(s['raw_total_hours'])}")
     say(f"  remaining to journeyman: {fmt_h(s['remaining_hours'])}")
     say("")
@@ -1322,9 +1339,12 @@ def cmd_report(args) -> None:
     L.append(f"- **Total proven hours: {s['total_hours']:,}** "
              f"({s['pct_to_target']}% of the {s['target_hours']:,}h journeyman target, "
              f"{s['remaining_hours']:,}h remaining)")
-    L.append(f"- Attribution: **{s['attributed_hours']['own']:,}h own**, "
-             f"**{s['attributed_hours']['coauthored']:,}h co-authored**, "
-             f"**{s['attributed_hours']['ai_only']:,}h AI-only**")
+    L.append(f"- Coding score: **{s['attributed_hours']['your_coding']:,}h yours**, "
+             f"**{s['attributed_hours']['ai_coding']:,}h AI**")
+    allocation = s["coauthor_allocation"]
+    L.append(f"- Shared-work allocation: **{allocation['shared_hours']:,}h** split "
+             f"**{allocation['your_share_pct']}% yours / "
+             f"{allocation['ai_share_pct']}% AI** from the base-hour ratio")
     L.append(f"- Raw per-source sum before overlap discount: **{s['raw_total_hours']:,}h**")
     L.append(f"- Local commits: **{s['total_commits']:,}** "
              f"(+{s['loc_added']:,} LOC added, net {s['net_loc']:,})")
@@ -1581,10 +1601,20 @@ def render_dashboard(s: dict, daily: dict) -> str:
     }
     stacked = {source: [round(daily["hours"][day].get(source, 0), 2) for day in days]
                for source in sources}
-    attributed = {
-        key: [round(daily["attributed"].get(day, {}).get(key, 0), 2) for day in days]
+    evidence_totals = {
+        key: sum(daily["attributed"].get(day, {}).get(key, 0) for day in days)
         for key in ("own", "coauthored", "ai_only")
     }
+    allocation = allocate_coding_hours(
+        evidence_totals["own"], evidence_totals["coauthored"], evidence_totals["ai_only"])
+    attributed = {"your_coding": [], "ai_coding": []}
+    for day in days:
+        evidence = daily["attributed"].get(day, {})
+        shared = evidence.get("coauthored", 0)
+        attributed["your_coding"].append(round(
+            evidence.get("own", 0) + shared * allocation["your_share"], 2))
+        attributed["ai_coding"].append(round(
+            evidence.get("ai_only", 0) + shared * allocation["ai_share"], 2))
     profile = s["profile"]
     payload = json.dumps({
         "days": days, "sources": sources, "stacked": stacked, "palette": palette,
@@ -1630,8 +1660,8 @@ align-items:end;border-bottom:3px solid var(--ink);padding-bottom:30px}} .archet
 .metric{{grid-column:span 3;padding:18px;min-height:145px;position:relative;overflow:hidden}}
 .metric.wide{{grid-column:span 6;background:var(--navy);color:#fff}} .metric .number{{font:800 clamp(2.2rem,5vw,5rem)/1 "Iowan Old Style","Palatino Linotype",serif;
 letter-spacing:-.05em;margin:12px 0}} .metric small{{color:var(--muted)}} .metric.wide small{{color:#b9c4c8}}
-.triad{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:18px}} .triad div{{border-top:1px solid #80909a;padding-top:9px}}
-.triad b{{font-size:1.3rem;display:block}} .panel{{padding:20px;margin-bottom:16px}} .panel h2{{font-size:1.6rem;margin-bottom:16px}}
+.duo{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:18px}} .duo div{{border-top:1px solid #80909a;padding-top:9px}}
+.duo b{{font-size:1.3rem;display:block}} .panel{{padding:20px;margin-bottom:16px}} .panel h2{{font-size:1.6rem;margin-bottom:16px}}
 .two{{display:grid;grid-template-columns:1.35fr 1fr;gap:16px}} .chartbox{{height:320px}} .badges{{display:grid;
 grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}} .badge{{display:flex;gap:15px;padding:15px;min-height:130px}}
 .badge-mark{{width:48px;height:48px;display:grid;place-items:center;border:1px solid var(--ink);border-radius:50%;font-weight:500}}
@@ -1656,9 +1686,8 @@ footer{{display:flex;justify-content:space-between;border-top:2px solid var(--in
 <article class="metric wide"><div class="eyebrow">Deduplicated attributed time</div>
 <div class="number">{s['total_hours']:,}h</div>
 <small>Raw source sum {s['raw_total_hours']:,}h · overlap discounted conservatively</small>
-<div class="triad"><div><span>Own</span><b>{s['attributed_hours']['own']:,}h</b></div>
-<div><span>Co-authored</span><b>{s['attributed_hours']['coauthored']:,}h</b></div>
-<div><span>AI-only</span><b>{s['attributed_hours']['ai_only']:,}h</b></div></div></article>
+<div class="duo"><div><span>Your Coding</span><b>{s['attributed_hours']['your_coding']:,}h</b></div>
+<div><span>AI Coding</span><b>{s['attributed_hours']['ai_coding']:,}h</b></div></div></article>
 <article class="metric"><div class="eyebrow">Commits</div><div class="number">{s['total_commits']:,}</div>
 <small>+{s['loc_added']:,} LOC · net {s['net_loc']:,}</small></article>
 <article class="metric"><div class="eyebrow">AI sessions</div><div class="number">{s['sessions']:,}</div>
@@ -1670,8 +1699,8 @@ footer{{display:flex;justify-content:space-between;border-top:2px solid var(--in
 <section class="two"><article class="panel"><h2>Raw hours by source</h2><div class="chartbox"><canvas id="source"></canvas></div></article>
 <article class="panel"><h2>Top projects</h2><table><thead><tr><th>Project</th><th>Hours</th><th>+LOC</th><th>-LOC</th></tr></thead>
 <tbody>{project_rows}</tbody></table></article></section>
-<article class="panel method"><h2>How attribution works</h2><p>Own time is Git and editor activity outside measured agent overlap.
-Co-authored time is agent activity within ten minutes of a human steering turn. AI-only time is autonomous assistant/tool activity outside that window.
+<article class="panel method"><h2>How attribution works</h2><p>The scorecard has two categories: Your Coding and AI Coding.
+Shared work is allocated between them using the ratio of measured human-only to AI-only base hours ({s['coauthor_allocation']['your_share_pct']}% yours / {s['coauthor_allocation']['ai_share_pct']}% AI).
 Daily human and agent proxies are overlap-discounted; GitHub aggregates add commits and LOC but never synthetic hours. Badge thresholds are visible and reproducible.
 Transcript bodies, prompts, secrets, and tool output are not stored.</p></article>
 <footer><span>ALL DATA LOCAL</span><span>{s['active_days']} ACTIVE DAYS / BEST STREAK {s['best_streak']}D</span></footer>
@@ -1679,9 +1708,8 @@ Transcript bodies, prompts, secrets, and tool output are not stored.</p></articl
 const D={payload}; Chart.defaults.color="#4f574f"; Chart.defaults.font.family='"SFMono-Regular",monospace';
 Chart.defaults.borderColor="#b9b39f";
 new Chart(document.getElementById("attr"),{{type:"bar",data:{{labels:D.days,datasets:[
-{{label:"Own",data:D.attributed.own,backgroundColor:"#2a9d8f",stack:"a"}},
-{{label:"Co-authored",data:D.attributed.coauthored,backgroundColor:"#e9c46a",stack:"a"}},
-{{label:"AI-only",data:D.attributed.ai_only,backgroundColor:"#e76f51",stack:"a"}}]}},
+{{label:"Your Coding",data:D.attributed.your_coding,backgroundColor:"#2a9d8f",stack:"a"}},
+{{label:"AI Coding",data:D.attributed.ai_coding,backgroundColor:"#e76f51",stack:"a"}}]}},
 options:{{maintainAspectRatio:false,scales:{{x:{{stacked:true,ticks:{{maxTicksLimit:12}}}},y:{{stacked:true}}}}}}}});
 new Chart(document.getElementById("radar"),{{type:"radar",data:{{labels:Object.keys(D.dimensions),
 datasets:[{{data:Object.values(D.dimensions),backgroundColor:"rgba(216,255,79,.38)",borderColor:"#17211d",pointBackgroundColor:"#17211d"}}]}},

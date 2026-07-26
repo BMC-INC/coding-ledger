@@ -210,11 +210,17 @@ class LedgerTestCase(unittest.TestCase):
                   "user_messages": 2, "tools": 4})
         self.db.commit()
         summary = ledger.summarize(self.db)
+        self.assertEqual(
+            set(summary["attributed_hours"]), {"your_coding", "ai_coding"})
+        self.assertAlmostEqual(
+            sum(summary["attributed_hours"].values()), summary["total_hours"])
         summary["scan_state"] = "complete"
         summary["completed_scans"] = 1
         daily = summary.pop("_daily")
         rendered = ledger.render_dashboard(summary, daily)
-        self.assertIn("Co-authored", rendered)
+        self.assertIn("Your Coding", rendered)
+        self.assertIn("AI Coding", rendered)
+        self.assertNotIn('label:"Co-authored"', rendered)
         self.assertIn("Earned field badges", rendered)
         self.assertIn("Builder dimensions", rendered)
         self.assertNotIn("SECRET", rendered)

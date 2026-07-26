@@ -75,13 +75,18 @@ Coding Ledger reports two totals:
 - **Attributed total** conservatively discounts overlap between agent sessions and
   human Git/editor proxies.
 
-The attributed total is divided into:
+The attributed total has two scorecard categories:
 
-- **Own:** Git and VS Code activity outside measured agent overlap.
-- **Co-authored:** agent activity within ten minutes of an explicit human steering
-  turn. Explicit Git `Co-authored-by` trailers are retained as supporting evidence.
-- **AI-only:** assistant and tool activity outside the steering window, or automated
-  sessions with no human turn.
+- **Your Coding:** measured human-only base hours plus your proportional share of
+  shared work.
+- **AI Coding:** measured AI-only base hours plus AI's proportional share of shared
+  work.
+
+Shared work is agent activity within ten minutes of an explicit human steering turn.
+It is split using the ratio of human-only to AI-only base hours. For example, if the
+base evidence is 100 human hours and 50 AI hours, two-thirds of shared hours go to
+Your Coding and one-third goes to AI Coding. Explicit Git `Co-authored-by` trailers
+remain supporting evidence for badges, not a third scorecard category.
 
 These are evidence-based estimates, not claims about who typed each line. The JSON
 report exposes the raw totals, attributed totals, source breakdown, and underlying
