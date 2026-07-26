@@ -75,8 +75,8 @@ by exact local Git receipts.
 Coding Ledger reports two totals:
 
 - **Raw source sum** preserves every source's independent hours.
-- **Attributed total** conservatively discounts overlap between agent sessions and
-  human Git/editor proxies.
+- **Attributed total** discounts only timestamp-qualified shared agent activity
+  against human Git/editor proxies. Independently running AI time remains additive.
 
 The attributed total has two scorecard categories:
 
@@ -90,6 +90,17 @@ It is split using the ratio of human-only to AI-only base hours. For example, if
 base evidence is 100 human hours and 50 AI hours, two-thirds of shared hours go to
 Your Coding and one-third goes to AI Coding. Explicit Git `Co-authored-by` trailers
 remain supporting evidence for badges, not a third scorecard category.
+
+For each day, credited time is:
+
+```text
+max(human Git/editor evidence, timestamp-qualified shared AI time)
++ independent AI time
+```
+
+Agent sources without sufficient steering metadata default their full duration to
+shared work. This preserves a conservative fallback without treating all AI work on
+the same calendar day as concurrent.
 
 These are evidence-based estimates, not claims about who typed each line. The JSON
 report exposes the raw totals, attributed totals, source breakdown, and underlying

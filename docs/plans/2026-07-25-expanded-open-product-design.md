@@ -55,6 +55,7 @@ The expanded report adds transparent, reproducible analytics:
 - tool and agent mix
 - verification-loop density
 - session-to-commit conversion and lag where timestamps support matching
+- timestamp-qualified overlap accounting that preserves independent AI runtime
 - parallel-agent utilization
 - shipping cadence and streaks
 - evidence coverage and confidence by source

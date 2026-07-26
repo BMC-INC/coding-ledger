@@ -71,6 +71,44 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(allocation["ai_coding"], 5)
         self.assertEqual(allocation["your_share"], 0.5)
 
+    def test_independent_ai_time_is_not_removed_as_daily_overlap(self):
+        start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        ledger.insert_event(
+            self.db, "codex:independent", "codex", "session", start,
+            start + timedelta(hours=3), "widget",
+            meta={"active_s": 10800, "days": {"2026-01-01": 10800},
+                  "coauthored_s": 7200, "ai_only_s": 3600})
+        for offset in range(37):
+            ts = start + timedelta(minutes=offset)
+            ledger.insert_event(
+                self.db, f"git:{offset}", "git", "commit", ts, ts,
+                "widget", items=1)
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        # Git's capped daily proxy contributes 4h. Only the 2h co-authored
+        # portion overlaps it; the 1h independent AI portion remains additive.
+        self.assertEqual(summary["raw_total_hours"], 7)
+        self.assertEqual(summary["total_hours"], 5)
+        self.assertEqual(summary["overlap_discount_hours"], 2)
+        self.assertEqual(summary["overlap_discount_pct"], 28.4)
+
+    def test_agent_time_without_steering_detail_uses_conservative_fallback(self):
+        start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        ledger.insert_event(
+            self.db, "agent:legacy", "codex", "session", start,
+            start + timedelta(hours=3), "widget",
+            meta={"active_s": 10800, "days": {"2026-01-01": 10800}})
+        for offset in range(37):
+            ts = start + timedelta(minutes=offset)
+            ledger.insert_event(
+                self.db, f"git:legacy:{offset}", "git", "commit", ts, ts,
+                "widget", items=1)
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        self.assertEqual(summary["raw_total_hours"], 7)
+        self.assertEqual(summary["total_hours"], 4)
+        self.assertEqual(summary["overlap_discount_hours"], 3)
+
     def test_codex_parser_extracts_metadata_without_transcript_text(self):
         session = self.root / "rollout.jsonl"
         rows = [
@@ -309,6 +347,8 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("Project diversity", rendered)
         self.assertIn("Diversity momentum", rendered)
         self.assertNotIn("Fragmentation", rendered)
+        self.assertIn("timestamp-qualified concurrency discount", rendered)
+        self.assertIn("Independently running AI time remains additive", rendered)
         self.assertNotIn("SECRET", rendered)
         landing = ledger.render_landing(summary)
         self.assertIn("Prove how you build", landing)

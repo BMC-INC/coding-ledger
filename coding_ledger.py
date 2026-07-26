@@ -1249,11 +1249,14 @@ def compute_daily(db: sqlite3.Connection) -> dict:
         hours[day][source] += h
 
     for day, per_source in hours.items():
-        agent_h = sum(per_source.get(source, 0.0) for source in AGENT_SOURCES)
         human_h = per_source.get("git", 0.0) + sum(
             per_source.get(source, 0.0) for source in EDITOR_SOURCES)
         bucket = attributed.setdefault(day, {"coauthored": 0.0, "ai_only": 0.0})
-        bucket["own"] = max(human_h - agent_h, 0.0)
+        # Only agent time classified from interaction timestamps as co-authored
+        # can overlap human evidence. Independently running AI time is additive.
+        # Parsers without steering detail default their full duration to
+        # co-authored, preserving the conservative fallback.
+        bucket["own"] = max(human_h - bucket["coauthored"], 0.0)
 
     return {"hours": hours, "loc": loc, "loc_add": loc_add,
             "commits": commits_per_day, "projects": proj, "attributed": attributed}
@@ -1482,6 +1485,7 @@ def summarize(db: sqlite3.Connection) -> dict:
     allocation = allocate_coding_hours(
         evidence_hours["own"], evidence_hours["coauthored"], evidence_hours["ai_only"])
     total_hours = allocation["your_coding"] + allocation["ai_coding"]
+    overlap_discount_hours = max(raw_total_hours - total_hours, 0.0)
     rounded_total = round(total_hours, 1)
     rounded_your = round(allocation["your_coding"], 1)
     attributed_hours = {
@@ -1527,6 +1531,10 @@ def summarize(db: sqlite3.Connection) -> dict:
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "total_hours": rounded_total,
         "raw_total_hours": round(raw_total_hours, 1),
+        "overlap_discount_hours": round(overlap_discount_hours, 1),
+        "overlap_discount_pct": round(
+            100 * overlap_discount_hours / raw_total_hours, 1)
+        if raw_total_hours else 0.0,
         "attributed_hours": attributed_hours,
         "coauthor_allocation": {
             "shared_hours": round(evidence_hours["coauthored"], 1),
@@ -1793,6 +1801,9 @@ def cmd_report(args) -> None:
              f"**{allocation['your_share_pct']}% yours / "
              f"{allocation['ai_share_pct']}% AI** from the base-hour ratio")
     L.append(f"- Raw per-source sum before overlap discount: **{s['raw_total_hours']:,}h**")
+    L.append(f"- Timestamp-qualified concurrency discount: "
+             f"**−{s['overlap_discount_hours']:,}h "
+             f"({s['overlap_discount_pct']}%)**")
     L.append(f"- Local commits: **{s['total_commits']:,}** "
              f"(+{s['loc_added']:,} LOC added, net {s['net_loc']:,})")
     if s["remote_commits"]:
@@ -2128,7 +2139,7 @@ auditable account of your work—without uploading prompts, source code, secrets
 <div class="actions"><a class="button" href="dashboard.html">Open the field report →</a>
 <a class="button dark" href="#evidence">See how it works</a></div></div>
 <aside class="proof"><div class="kicker">Live local ledger</div><div class="big">{s['total_hours']:,}h</div>
-<p>Deduplicated, overlap-discounted development evidence.</p><dl>
+<p>Deduplicated evidence after a {s['overlap_discount_pct']}% timestamp-qualified concurrency discount.</p><dl>
 <div><dt>Commits</dt><dd>{s['total_commits']:,}</dd></div>
 <div><dt>AI sessions</dt><dd>{s['sessions']:,}</dd></div>
 <div><dt>AI leverage</dt><dd>{analytics['ai_leverage_pct']}%</dd></div>
@@ -2305,7 +2316,7 @@ footer{{display:flex;justify-content:space-between;border-top:2px solid var(--in
 <section class="ledger-grid">
 <article class="metric wide"><div class="eyebrow">Deduplicated attributed time</div>
 <div class="number">{s['total_hours']:,}h</div>
-<small>Raw source sum {s['raw_total_hours']:,}h · overlap discounted conservatively</small>
+<small>Raw source sum {s['raw_total_hours']:,}h · −{s['overlap_discount_hours']:,}h ({s['overlap_discount_pct']}%) timestamp-qualified concurrency discount</small>
 <div class="duo"><div><span>Your Coding</span><b>{s['attributed_hours']['your_coding']:,}h</b></div>
 <div><span>AI Coding</span><b>{s['attributed_hours']['ai_coding']:,}h</b></div></div></article>
 <article class="metric"><div class="eyebrow">Commits</div><div class="number">{s['total_commits']:,}</div>
@@ -2322,7 +2333,7 @@ footer{{display:flex;justify-content:space-between;border-top:2px solid var(--in
 <tbody>{project_rows}</tbody></table></article></section>
 <article class="panel method"><h2>How attribution works</h2><p>The scorecard has two categories: Your Coding and AI Coding.
 Shared work is allocated between them using the ratio of measured human-only to AI-only base hours ({s['coauthor_allocation']['your_share_pct']}% yours / {s['coauthor_allocation']['ai_share_pct']}% AI).
-Daily human and agent proxies are overlap-discounted; GitHub aggregates add commits and LOC but never synthetic hours. Badge thresholds are visible and reproducible.
+Only AI activity inside the ten-minute window after an explicit human steering turn is eligible to overlap human Git/editor evidence. Independently running AI time remains additive; sources without steering detail default conservatively to shared work. GitHub aggregates add commits and LOC but never synthetic hours. Badge thresholds are visible and reproducible.
 Transcript bodies, prompts, secrets, and tool output are not stored.</p></article>
 <footer><span>ALL DATA LOCAL</span><span>{s['active_days']} ACTIVE DAYS / BEST STREAK {s['best_streak']}D</span></footer>
 </main><script>
