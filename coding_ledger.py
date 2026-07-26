@@ -2667,7 +2667,7 @@ def render_public_scorecard(s: dict, builder_name: str) -> str:
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23d8ff4f'/%3E%3Ctext x='13' y='45' font-size='40'%3EC%3C/text%3E%3C/svg%3E">
 <style>
 @page{{size:letter portrait;margin:0}} *{{box-sizing:border-box}}
-:root{{--paper:#f0eadb;--ink:#17211d;--muted:#687068;--acid:#d8ff4f;--navy:#16324f;--rule:#a9a58f}}
+:root{{--paper:#f0eadb;--ink:#17211d;--muted:#17211d;--acid:#d8ff4f;--navy:#16324f;--rule:#62685f}}
 html,body{{margin:0;background:#d5d0c2;color:var(--ink);font-family:"SFMono-Regular","Cascadia Mono",monospace}}
 .sheet{{width:100%;min-height:100vh;background:var(--paper);padding:4.5%;display:flex;flex-direction:column;
 background-image:linear-gradient(rgba(23,33,29,.045) 1px,transparent 1px);background-size:100% 28px}}
@@ -2681,9 +2681,9 @@ letter-spacing:-.055em;margin:12px 0 0;text-transform:uppercase}} .identity{{bor
 .score{{display:grid;grid-template-columns:1.25fr 1fr 1fr;background:var(--navy);color:white;margin:2.5% 0}}
 .score>div{{padding:4%;border-right:1px solid #657984;min-width:0}} .score>div:last-child{{border:0}}
 .score b{{display:block;font:800 clamp(34px,5vw,68px)/1 "Iowan Old Style",serif;margin:9px 0}}
-.score small{{color:#bdc8cc;font-size:10px}} .correction{{display:flex;align-items:center;gap:9px;border-top:1px solid #657984;
+.score small{{color:#fff;font-size:10px}} .correction{{display:flex;align-items:center;gap:9px;border-top:1px solid #8fa2aa;
 padding-top:9px;margin-top:9px}} .correction strong{{font:700 18px/1 "Iowan Old Style",serif;color:var(--acid)}}
-.correction span{{font-size:8px;line-height:1.35;text-transform:uppercase;letter-spacing:.08em;color:#dbe3e5}}
+.correction span{{font-size:8px;line-height:1.35;text-transform:uppercase;letter-spacing:.08em;color:#fff}}
 .metrics{{display:grid;grid-template-columns:repeat(4,1fr);gap:1.4%;margin-bottom:2.5%}}
 .metric{{border-top:2px solid;padding:2.5% 1%;min-width:0}} .metric b{{font:700 clamp(25px,3vw,42px)/1 "Iowan Old Style",serif;display:block;margin:8px 0}}
 .metric span{{font-size:9px;color:var(--muted);line-height:1.35;display:block}} .metric-pair{{display:grid;grid-template-columns:1fr 1fr;gap:8px}}

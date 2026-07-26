@@ -154,6 +154,8 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("commit-bearing repositories", scorecard)
         self.assertIn("observed workspace identities", scorecard)
         self.assertIn("overlap removed", scorecard)
+        self.assertIn("--muted:#17211d", scorecard)
+        self.assertIn(".score small{color:#fff", scorecard)
         self.assertNotIn("test calls / session", scorecard)
 
     def test_activity_rhythm_alternates_building_and_off_runs(self):
