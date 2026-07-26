@@ -123,15 +123,17 @@ class LedgerTestCase(unittest.TestCase):
         rhythm = ledger.activity_rhythm(
             ["2026-01-01", "2026-01-02", "2026-01-04",
              "2026-01-05", "2026-01-06", "2026-01-10"],
-            "2026-01-08")
-        self.assertEqual(rhythm["calendar_days"], 8)
-        self.assertEqual(rhythm["active_days"], 5)
+            "2026-01-08", "2026-01-02")
+        self.assertEqual(rhythm["calendar_days"], 7)
+        self.assertEqual(rhythm["active_days"], 4)
         self.assertEqual(rhythm["off_days"], 3)
         self.assertEqual(rhythm["longest_break_days"], 2)
         self.assertEqual(rhythm["streak_count"], 2)
         self.assertEqual(
             [(run["state"], run["days"]) for run in rhythm["runs"]],
-            [("building", 2), ("off", 1), ("building", 3), ("off", 2)])
+            [("building", 1), ("off", 1), ("building", 3), ("off", 2)])
+        self.assertEqual(rhythm["start_day"], "2026-01-02")
+        self.assertEqual(rhythm["end_day"], "2026-01-08")
 
     def test_codex_parser_extracts_metadata_without_transcript_text(self):
         session = self.root / "rollout.jsonl"
@@ -156,6 +158,7 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(parsed["test_calls"], 1)
         serialized = json.dumps(parsed, default=str)
         self.assertNotIn("SECRET", serialized)
+        self.assertNotIn("shell", serialized)
         self.assertNotIn("pytest", serialized)
 
     def test_codex_project_skips_dated_task_container(self):
@@ -240,7 +243,43 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(parsed["active_s"], 180)
         serialized = json.dumps(parsed, default=str)
         self.assertNotIn("SECRET", serialized)
-        self.assertNotIn("shell", serialized)
+
+    def test_github_platform_bot_commits_become_zero_hour_activity(self):
+        repo_list = json.dumps([{
+            "name": "partsgenie-ai",
+            "nameWithOwner": "BMC-INC/partsgenie-ai",
+            "isFork": False,
+        }])
+        stats = json.dumps([{
+            "author": {"login": "lovable-dev[bot]"},
+            "weeks": [{"w": 1760832000, "c": 3, "a": 100, "d": 10}],
+        }])
+
+        def fake_gh(args, timeout=60):
+            joined = " ".join(args)
+            if "repo list" in joined:
+                return 0, repo_list
+            if "stats/contributors" in joined:
+                return 0, stats
+            if "repos/BMC-INC/partsgenie-ai/commits?per_page=100" in joined:
+                return 0, "abc123\t2025-10-21T03:50:32Z\n"
+            return 1, ""
+
+        with mock.patch.object(ledger, "_gh", side_effect=fake_gh):
+            added, notes = ledger.scan_github(
+                self.db, ["BMC-INC"], "james", {"partsgenie-ai"})
+        self.assertEqual(notes, [])
+        self.assertEqual(added, 1)
+        row = self.db.execute(
+            "SELECT kind,items,meta FROM events WHERE uid LIKE "
+            "'github-activity:%'").fetchone()
+        self.assertEqual(row[0], "remote_activity")
+        self.assertEqual(row[1], 0)
+        self.assertTrue(json.loads(row[2])["platform_bot"])
+        self.assertEqual(json.loads(row[2])["platform"], "lovable")
+        summary = ledger.summarize(self.db)
+        self.assertEqual(summary["raw_total_hours"], 0)
+        self.assertEqual(summary["activity_rhythm"]["active_days"], 1)
 
     def test_sessionization_splits_credit_across_midnight(self):
         start = datetime(2026, 1, 1, 23, 59, 30).astimezone()

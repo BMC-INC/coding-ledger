@@ -68,6 +68,8 @@ ALL_SOURCES = [
 ]
 AGENT_SOURCES = ("claude", "codex", "gemini", "grok", "cursor", "aider")
 EDITOR_SOURCES = ("vscode", "antigravity")
+LOVABLE_BOT_LOGINS = ("lovable-dev[bot]",)
+LOVABLE_COMMIT_AUTHOR_NAMES = ("gpt-engineer-app[bot]",)
 DEFAULT_ROOTS = [HOME / "Projects", HOME / "dev", HOME / "Documents" / "Codex"]
 
 IDLE_GAP_S = 30 * 60          # gap that splits a session
@@ -1109,8 +1111,7 @@ def scan_github(db: sqlite3.Connection, owners: list[str], login: str,
         repos = [r for r in json.loads(out or "[]") if not r["isFork"]]
         say(f"  github: {owner}: {len(repos)} repos")
         for r in repos:
-            if r["name"].lower() in local_repo_names:
-                continue  # counted precisely by the local git scan
+            is_local = r["name"].lower() in local_repo_names
             full = r["nameWithOwner"]
             stats = None
             for attempt in range(3):
@@ -1128,17 +1129,67 @@ def scan_github(db: sqlite3.Connection, owners: list[str], login: str,
                 continue
             mine = next((s for s in stats
                          if (s.get("author") or {}).get("login", "").lower() == login.lower()), None)
-            if not mine:
-                continue
-            for w in mine.get("weeks", []):
-                if not (w.get("c") or w.get("a") or w.get("d")):
+            if mine and not is_local:
+                for w in mine.get("weeks", []):
+                    if not (w.get("c") or w.get("a") or w.get("d")):
+                        continue
+                    ts = datetime.fromtimestamp(w["w"], tz=timezone.utc)
+                    if insert_event(db, f"github:{full}:{w['w']}", "github", "gh_week",
+                                    ts, ts + timedelta(days=7), r["name"],
+                                    loc_add=w.get("a", 0), loc_del=w.get("d", 0),
+                                    items=w.get("c", 0)):
+                        added += 1
+
+            contributor_logins = {
+                str((entry.get("author") or {}).get("login") or "").lower()
+                for entry in stats}
+            # Human activity in a local repository is already represented by
+            # exact Git commits. Platform-authored history is independent
+            # evidence and must still be imported (for example, a project that
+            # began in Lovable and was cloned locally later).
+            actors = [login] if mine and not is_local else []
+            actors.extend(
+                bot for bot in LOVABLE_BOT_LOGINS
+                if bot.lower() in contributor_logins)
+            for actor in actors:
+                encoded_actor = urllib.parse.quote(actor, safe="")
+                is_lovable = actor in LOVABLE_BOT_LOGINS
+                commit_path = (
+                    f"repos/{full}/commits?per_page=100" if is_lovable
+                    else f"repos/{full}/commits?author={encoded_actor}&per_page=100")
+                jq_filter = ".[]"
+                if is_lovable:
+                    login_json = json.dumps(actor)
+                    name_checks = " or ".join(
+                        f"(.commit.author.name // \"\") == {json.dumps(name)}"
+                        for name in LOVABLE_COMMIT_AUTHOR_NAMES)
+                    jq_filter += (
+                        f" | select((.author.login // \"\") == {login_json} or "
+                        f"({name_checks}))")
+                rc, out = _gh([
+                    "api", "--paginate",
+                    commit_path,
+                    "--jq", f"{jq_filter} | [.sha,.commit.author.date] | @tsv",
+                ], timeout=90)
+                if rc:
+                    notes.append(f"commit activity unavailable: {full} ({actor})")
                     continue
-                ts = datetime.fromtimestamp(w["w"], tz=timezone.utc)
-                if insert_event(db, f"github:{full}:{w['w']}", "github", "gh_week",
-                                ts, ts + timedelta(days=7), r["name"],
-                                loc_add=w.get("a", 0), loc_del=w.get("d", 0),
-                                items=w.get("c", 0)):
-                    added += 1
+                for line in out.splitlines():
+                    parts = line.split("\t", 1)
+                    ts = parse_iso(parts[1]) if len(parts) == 2 else None
+                    if not ts:
+                        continue
+                    if insert_event(
+                            db, f"github-activity:{full}:{parts[0]}", "github",
+                            "remote_activity", ts, ts, r["name"], meta={
+                                "actor": actor,
+                                "platform_bot": actor.lower() != login.lower(),
+                                "platform": (
+                                    "lovable" if is_lovable
+                                    else "github"),
+                                "repository": full,
+                            }):
+                        added += 1
     return added, notes
 
 
@@ -1195,6 +1246,7 @@ def compute_daily(db: sqlite3.Connection) -> dict:
     commits_per_day: dict[str, int] = {}
     commits_day_proj: dict[tuple[str, str], int] = {}
     edits_per_day: dict[tuple[str, str], int] = {}
+    evidence_days: set[str] = set()
     attributed: dict[str, dict[str, float]] = {}
     proj: dict[str, dict[str, float]] = {}    # project -> {hours, loc_add, loc_del}
 
@@ -1217,6 +1269,7 @@ def compute_daily(db: sqlite3.Connection) -> dict:
             coauthored_s = int(meta.get("coauthored_s", active_s))
             ai_only_s = int(meta.get("ai_only_s", max(active_s - coauthored_s, 0)))
             for d, secs in (meta.get("days") or {}).items():
+                evidence_days.add(d)
                 hours.setdefault(d, {}).setdefault(source, 0.0)
                 hours[d][source] += secs / 3600
                 share = secs / active_s if active_s else 0
@@ -1225,6 +1278,7 @@ def compute_daily(db: sqlite3.Connection) -> dict:
                 bucket["ai_only"] += ai_only_s * share / 3600
             bump_proj(project, h=active_s / 3600)
         elif kind == "commit" and day:
+            evidence_days.add(day)
             commits_per_day[day] = commits_per_day.get(day, 0) + 1
             commits_day_proj[(day, project or "misc")] = \
                 commits_day_proj.get((day, project or "misc"), 0) + 1
@@ -1232,10 +1286,13 @@ def compute_daily(db: sqlite3.Connection) -> dict:
             loc_add[day] = loc_add.get(day, 0) + la
             bump_proj(project, a=la, d=ld)
         elif kind == "edit" and day:
+            evidence_days.add(day)
             key = (day, source)
             edits_per_day[key] = edits_per_day.get(key, 0) + items
         elif kind == "gh_week" and day:
             bump_proj(project, a=la, d=ld)
+        elif kind == "remote_activity" and day:
+            evidence_days.add(day)
 
     day_proj: dict[str, dict[str, int]] = {}
     for (d, p), cnt in commits_day_proj.items():
@@ -1262,8 +1319,10 @@ def compute_daily(db: sqlite3.Connection) -> dict:
         # co-authored, preserving the conservative fallback.
         bucket["own"] = max(human_h - bucket["coauthored"], 0.0)
 
+    evidence_days.update(hours)
     return {"hours": hours, "loc": loc, "loc_add": loc_add,
-            "commits": commits_per_day, "projects": proj, "attributed": attributed}
+            "commits": commits_per_day, "projects": proj, "attributed": attributed,
+            "evidence_days": sorted(evidence_days)}
 
 
 def allocate_coding_hours(own: float, coauthored: float, ai_only: float) -> dict[str, float]:
@@ -1287,17 +1346,22 @@ def allocate_coding_hours(own: float, coauthored: float, ai_only: float) -> dict
     }
 
 
-def activity_rhythm(active_day_strings: list[str], report_day: str) -> dict:
+def activity_rhythm(active_day_strings: list[str], report_day: str,
+                    start_day: str | None = None) -> dict:
     """Return alternating building/off calendar runs through the report day."""
     end = datetime.strptime(report_day, "%Y-%m-%d").date()
     active = {
         datetime.strptime(day, "%Y-%m-%d").date() for day in active_day_strings}
     active = {day for day in active if day <= end}
+    if start_day:
+        requested_start = datetime.strptime(start_day, "%Y-%m-%d").date()
+        active = {day for day in active if day >= requested_start}
     if not active:
         return {
             "calendar_days": 0, "active_days": 0, "off_days": 0,
-            "longest_break_days": 0, "streak_count": 0, "runs": []}
-    start = min(active)
+            "longest_break_days": 0, "streak_count": 0, "runs": [],
+            "start_day": None, "end_day": end.isoformat()}
+    start = requested_start if start_day else min(active)
     runs: list[dict] = []
     cursor = start
     run_start = start
@@ -1328,6 +1392,8 @@ def activity_rhythm(active_day_strings: list[str], report_day: str) -> dict:
         "longest_break_days": max(
             (run["days"] for run in runs if run["state"] == "off"), default=0),
         "streak_count": sum(run["state"] == "building" for run in runs),
+        "start_day": start.isoformat(),
+        "end_day": end.isoformat(),
         "runs": runs,
     }
 
@@ -1548,7 +1614,7 @@ def summarize(db: sqlite3.Connection) -> dict:
                          "loc_del": r[3] or 0, "items": r[4] or 0} for r in rows}
 
     first = db.execute("SELECT MIN(ts_start), MAX(COALESCE(ts_end, ts_start)) FROM events").fetchone()
-    days_active = sorted(hours.keys())
+    days_active = agg["evidence_days"]
     streak = best_streak = 0
     prev = None
     for d in days_active:
@@ -1577,7 +1643,24 @@ def summarize(db: sqlite3.Connection) -> dict:
         int((json.loads(row[0]) if row[0] else {}).get("trajectory_receipts", 0))
         for row in db.execute("SELECT meta FROM events WHERE kind='agent_receipts'"))
     generated_at = datetime.now().astimezone()
-    rhythm = activity_rhythm(days_active, generated_at.date().isoformat())
+    first_attributable = db.execute(
+        "SELECT ts_start FROM events "
+        "WHERE kind IN ('session','commit','edit','remote_activity') "
+        "AND project IS NOT NULL AND project NOT IN "
+        "('misc','Unattributed workspace','-Users-kingjames','Users-kingjames') "
+        "ORDER BY ts_start LIMIT 1").fetchone()
+    first_attributable_day = None
+    if first_attributable:
+        first_ts = parse_iso(first_attributable[0])
+        first_attributable_day = local_day(first_ts) if first_ts else None
+    rhythm = activity_rhythm(
+        days_active, generated_at.date().isoformat(), first_attributable_day)
+    building_runs = [
+        run["days"] for run in rhythm["runs"] if run["state"] == "building"]
+    best_streak = max(building_runs, default=0)
+    cur_streak = (
+        rhythm["runs"][-1]["days"]
+        if rhythm["runs"] and rhythm["runs"][-1]["state"] == "building" else 0)
     return {
         "generated_at": generated_at.isoformat(timespec="seconds"),
         "total_hours": rounded_total,
@@ -1606,12 +1689,12 @@ def summarize(db: sqlite3.Connection) -> dict:
         "total_commits": per_source.get("git", {}).get("items", 0),
         "repositories_with_commits": db.execute(
             "SELECT COUNT(DISTINCT project) FROM events "
-            "WHERE source='git' AND kind='commit' AND project IS NOT NULL"
+            "WHERE kind IN ('commit','remote_activity') AND project IS NOT NULL"
         ).fetchone()[0],
         "remote_commits": per_source.get("github", {}).get("items", 0),
         "sessions": session_count,
         "trajectory_receipts": trajectory_receipts,
-        "active_days": len(days_active),
+        "active_days": rhythm["active_days"],
         "first_activity": first[0], "last_activity": first[1],
         "best_streak": best_streak, "current_streak": cur_streak,
         "activity_rhythm": rhythm,
@@ -1826,7 +1909,9 @@ def cmd_status(args) -> None:
         f"session→commit: {analytics['session_commit_conversion_pct']}%")
     say(f"  active days: {s['active_days']:,}   streak: {s['current_streak']}d "
         f"(best {s['best_streak']}d)")
-    say(f"  span: {(s['first_activity'] or '?')[:10]} → {(s['last_activity'] or '?')[:10]}")
+    rhythm = s["activity_rhythm"]
+    say(f"  building span: {rhythm['start_day'] or '?'} → "
+        f"{rhythm['end_day'] or '?'}")
     last = db.execute("SELECT finished_at, sources, added, notes, status FROM scans "
                       "ORDER BY id DESC LIMIT 1").fetchone()
     if last:
@@ -1872,10 +1957,11 @@ def cmd_report(args) -> None:
     rhythm = s["activity_rhythm"]
     L.append(f"- Activity rhythm: **{rhythm['active_days']:,} building / "
              f"{rhythm['off_days']:,} off days** across "
-             f"{rhythm['calendar_days']:,} calendar days; "
+             f"{rhythm['calendar_days']:,} calendar days "
+             f"({rhythm['start_day']} → {rhythm['end_day']}); "
              f"{rhythm['streak_count']:,} building streaks, "
              f"{rhythm['longest_break_days']:,}d longest break")
-    L.append(f"- Span: {(s['first_activity'] or '?')[:10]} → {(s['last_activity'] or '?')[:10]}\n")
+    L.append("")
     L.append("## Hours by source\n")
     L.append("| Source | Hours | Events |")
     L.append("|--------|------:|-------:|")
@@ -2512,9 +2598,9 @@ h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
 <div class="rhythm-stat"><b>{rhythm['off_days']:,}</b><span>off days</span></div>
 <div class="rhythm-stat"><b>{rhythm['streak_count']:,}</b><span>building streaks</span></div>
 <div class="rhythm-stat"><b>{rhythm['longest_break_days']:,}d</b><span>longest break</span></div></div>
-<div class="rhythm-bar" role="img" aria-label="{rhythm['active_days']} building days and {rhythm['off_days']} off days from first activity through report day">{rhythm_segments}</div>
+<div class="rhythm-bar" role="img" aria-label="{rhythm['active_days']} building days and {rhythm['off_days']} off days from first attributable project activity on {rhythm['start_day']} through report day {rhythm['end_day']}">{rhythm_segments}</div>
 <div class="rhythm-legend"><span class="on">Building</span><span class="off">Off</span></div>
-<p class="rhythm-copy"><b>Recent sequence:</b> {html.escape(recent_rhythm)}</p></article>
+<p class="rhythm-copy"><b>{rhythm['start_day']} → {rhythm['end_day']}:</b> first attributable project activity through report day. <b>Recent sequence:</b> {html.escape(recent_rhythm)}</p></article>
 <section class="two"><article class="panel"><h2>Attributed work, over time</h2><div class="chartbox"><canvas id="attr"></canvas></div></article>
 <article class="panel"><h2>Builder dimensions</h2><div class="chartbox"><canvas id="radar"></canvas></div></article></section>
 <article class="panel"><h2>Earned field badges</h2><div class="badges">{badge_cards}</div></article>
@@ -2593,7 +2679,7 @@ align-items:center;border:1px solid;padding:2%;margin-bottom:2.5%}} .public-rhyt
 <div class="top"><span>Coding Ledger / Public Builder Scorecard</span><span class="status">Evidence-based</span></div>
 <section class="hero"><div><div class="kicker">Prove how you build</div><h1>Builder<br>field report.</h1></div>
 <div class="identity"><div class="label">Builder</div><strong>{html.escape(builder_name)}</strong>
-<p>{html.escape(profile['archetype'])} · {s['active_days']:,} active days · best streak {s['best_streak']} days</p></div></section>
+<p>{html.escape(profile['archetype'])} · {rhythm['active_days']:,} attributable building days · best streak {s['best_streak']} days</p></div></section>
 <section class="score"><div><div class="label">Attributed development time</div><b>{s['total_hours']:,}h</b>
 <small>{s['raw_total_hours']:,}h raw evidence · −{s['overlap_discount_pct']}% concurrency</small></div>
 <div><div class="label">Your Coding</div><b>{s['attributed_hours']['your_coding']:,}h</b><small>human-side attribution</small></div>
@@ -2604,7 +2690,7 @@ align-items:center;border:1px solid;padding:2%;margin-bottom:2.5%}} .public-rhyt
 <div class="metric"><div class="label">AI sessions</div><b>{s['sessions']:,}</b><span>metadata-only evidence</span></div>
 <div class="metric"><div class="label">Session → commit</div><b>{a['session_commit_conversion_pct']}%</b><span>within seven days</span></div></section>
 <section class="public-rhythm"><b>{rhythm['active_days']:,} on / {rhythm['off_days']:,} off</b>
-<p><span class="label">Building rhythm across {rhythm['calendar_days']:,} calendar days</span><br>
+<p><span class="label">Building rhythm across {rhythm['calendar_days']:,} calendar days · {rhythm['start_day']} → {rhythm['end_day']}</span><br>
 {rhythm['streak_count']:,} building streaks · {rhythm['longest_break_days']:,}d longest break · recent: {html.escape(recent_rhythm)}</p></section>
 <section class="band"><article class="panel"><div class="label">Portfolio breadth</div><h2>{a['project_diversity_pct']}% project diversity</h2>
 <p>Neutral inverse-concentration measure across {a['active_projects']:,} active project identities. Diversity momentum: {momentum_text} commits on multi-project workflow days.</p></article>
