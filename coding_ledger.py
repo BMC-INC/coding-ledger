@@ -1641,6 +1641,7 @@ def render_dashboard(s: dict, daily: dict) -> str:
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Coding Ledger — Builder Field Report</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23d8ff4f'/%3E%3Ctext x='13' y='45' font-size='40'%3EC%3C/text%3E%3C/svg%3E">
 {chartjs_tag()}
 <style>
 :root{{--paper:#f0eadb;--ink:#17211d;--muted:#6d7167;--rule:#b9b39f;--acid:#d8ff4f;

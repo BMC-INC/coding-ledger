@@ -221,6 +221,7 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("Your Coding", rendered)
         self.assertIn("AI Coding", rendered)
         self.assertNotIn('label:"Co-authored"', rendered)
+        self.assertIn('rel="icon"', rendered)
         self.assertIn("Earned field badges", rendered)
         self.assertIn("Builder dimensions", rendered)
         self.assertNotIn("SECRET", rendered)
