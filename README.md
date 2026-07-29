@@ -21,6 +21,7 @@ self-contained and works offline.
 | Aider | `.aider.chat.history.md` timestamps | Sessionized active time |
 | VS Code | Local History edit timestamps | Capped edit proxy |
 | GitHub | Contributor-week commits and LOC for remote-only repositories | Zero hours |
+| Screen Time | macOS per-app foreground intervals (bundle ids and durations only) | Envelope, never additive |
 
 Git commits are deduplicated by SHA. Growing agent sessions are replaced by stable,
 path-based event IDs, making rescans idempotent.
@@ -112,6 +113,35 @@ Current time heuristics:
 - Git: `0.35h + 0.10h × commits` per active day, capped at six hours.
 - VS Code: two minutes per history edit, capped at 90 minutes per day.
 - GitHub: commits and LOC only; zero hours.
+- Screen Time: measured foreground intervals, capped at 18 hours per day.
+
+## Total involved time (screen-verified)
+
+Receipts alone miss the reading, reviewing, and debugging time that never
+produces a commit or an agent session. The `screen` source reads macOS Screen
+Time foreground intervals for an allowlist of coding apps (terminals, editors,
+IDEs, agent desktop apps; browsers excluded by default) and persists them into
+the ledger before Apple's roughly four-week retention prunes them. Override the
+allowlist at `~/.coding-ledger/screen_apps.json` with `include`/`exclude`
+fnmatch pattern lists; edits re-filter all persisted history.
+
+Screen time overlaps git, editor, and steering evidence, so it is an envelope,
+never an additive source. The explicit per-day formula:
+
+```text
+screen_hours   = allowlisted foreground seconds / 3600 (18h/day cap)
+uncaptured     = max(0, screen_hours - max(human_evidence, shared_ai))
+total_involved = max(human_evidence, shared_ai, screen_hours) + independent_ai
+               = attributed_total + uncaptured
+```
+
+`uncaptured` is coding-app time with no receipt. It credits to Your Coding,
+never to AI Coding, and is always reported as its own labeled line. The raw
+source sum and the attributed total are unchanged; total involved time is a
+third explicit total. A day needs at least 15 minutes of coding-app screen
+time to count as an active day on its own. If the store is unreadable (Full
+Disk Access not granted to the scanning context), the scan records a warning
+and totals fall back to attributed-only; the gap is labeled, never inferred.
 
 ## Workflow analytics
 
@@ -179,6 +209,9 @@ It does **not** store:
 
 The database stores minimal provenance: source path, project identifier, day buckets,
 active seconds, attribution seconds, and aggregate counts.
+
+For Screen Time, Coding Ledger reads only app bundle identifiers and interval
+durations. It never reads window titles, document names, or URLs.
 
 ## Public exports
 

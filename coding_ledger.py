@@ -64,7 +64,7 @@ LANDING_PATH = LEDGER_DIR / "index.html"
 
 ALL_SOURCES = [
     "git", "claude", "codex", "gemini", "antigravity", "grok",
-    "cursor", "aider", "vscode", "github",
+    "cursor", "aider", "vscode", "github", "screen",
 ]
 AGENT_SOURCES = ("claude", "codex", "gemini", "grok", "cursor", "aider")
 EDITOR_SOURCES = ("vscode", "antigravity")
@@ -81,6 +81,24 @@ GIT_DAY_CAP_H = 6.0           # cap on git density credit per day
 VSCODE_PER_EDIT_S = 120       # activity credit per local-history edit
 VSCODE_DAY_CAP_S = 90 * 60    # cap per day
 TARGET_HOURS = 10_000
+
+# macOS Screen Time (foreground app-usage intervals). Apple retains roughly
+# four weeks, so scans persist the intervals into the ledger before pruning.
+KNOWLEDGE_DB = HOME / "Library" / "Application Support" / "Knowledge" / "knowledgeC.db"
+APPLE_EPOCH_S = 978307200     # 2001-01-01 UTC, the Core Data epoch
+SCREEN_APPS_CONFIG = LEDGER_DIR / "screen_apps.json"
+SCREEN_DAY_CAP_H = 18.0       # sanity cap on foreground coding hours per day
+SCREEN_MIN_EVIDENCE_H = 0.25  # a day needs 15 min in coding apps to count active
+SCREEN_MIN_APP_DAY_S = 60     # ignore sub-minute per-app daily slivers
+# fnmatch patterns; browsers stay out because browsing intent is ambiguous
+DEFAULT_SCREEN_APPS = [
+    "com.apple.Terminal", "com.googlecode.iterm2", "dev.warp.Warp*",
+    "org.alacritty", "net.kovidgoyal.kitty", "com.github.wez.wezterm",
+    "com.microsoft.VSCode*", "com.todesktop.*",  # Cursor ships via ToDesktop
+    "com.exafunction.windsurf*", "dev.zed.Zed*",
+    "com.apple.dt.Xcode", "com.jetbrains.*", "com.google.android.studio*",
+    "com.google.antigravity*", "com.anthropic.*", "com.openai.codex",
+]
 
 GIT_TIMEOUT_S = 60            # per-repo git subprocess timeout (iCloud hangs)
 SKIP_DIR_NAMES = {
@@ -1089,6 +1107,117 @@ def scan_vscode(db: sqlite3.Connection) -> tuple[int, list[str]]:
     return _scan_vscode_history(db, hist, "vscode")
 
 
+# ---------------------------------------------------------------- screen time
+# macOS records per-app foreground intervals in knowledgeC.db (/app/usage).
+# Every observed app's daily seconds are persisted (bundle id only — no window
+# titles, documents, or URLs), so editing the allowlist later re-filters the
+# full persisted history, not just Apple's ~4-week retention window.
+
+def load_screen_config() -> tuple[list[str], list[str]]:
+    """(include, exclude) fnmatch pattern lists; user file overrides defaults."""
+    include, exclude = list(DEFAULT_SCREEN_APPS), []
+    try:
+        cfg = json.loads(SCREEN_APPS_CONFIG.read_text())
+    except OSError:
+        return include, exclude
+    except ValueError:
+        warn(f"screen: invalid JSON in {SCREEN_APPS_CONFIG}; using default allowlist")
+        return include, exclude
+    if isinstance(cfg, dict):
+        if isinstance(cfg.get("include"), list):
+            include = [str(p) for p in cfg["include"]]
+        if isinstance(cfg.get("exclude"), list):
+            exclude = [str(p) for p in cfg["exclude"]]
+    return include, exclude
+
+
+def screen_app_allowed(bundle: str, include: list[str], exclude: list[str]) -> bool:
+    if any(fnmatch.fnmatchcase(bundle, pat) for pat in exclude):
+        return False
+    return any(fnmatch.fnmatchcase(bundle, pat) for pat in include)
+
+
+def merge_intervals(
+        intervals: list[tuple[datetime, datetime]]) -> list[tuple[datetime, datetime]]:
+    merged: list[list[datetime]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(start, end) for start, end in merged]
+
+
+def seconds_by_local_day(start: datetime, end: datetime) -> dict[str, int]:
+    """Allocate an interval's seconds to local calendar days, split at midnight."""
+    out: dict[str, int] = {}
+    cur, end_l = start.astimezone(), end.astimezone()
+    while cur < end_l:
+        midnight = (cur + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        seg_end = min(end_l, midnight)
+        day = cur.strftime("%Y-%m-%d")
+        out[day] = out.get(day, 0) + int((seg_end - cur).total_seconds())
+        cur = seg_end
+    return out
+
+
+def read_screen_intervals(store: Path) -> list[tuple[str, datetime, datetime]]:
+    conn = sqlite3.connect(f"file:{store}?mode=ro", uri=True, timeout=10)
+    try:
+        rows = conn.execute(
+            "SELECT ZVALUESTRING, ZSTARTDATE, ZENDDATE FROM ZOBJECT "
+            "WHERE ZSTREAMNAME='/app/usage' AND ZVALUESTRING IS NOT NULL "
+            "AND ZENDDATE > ZSTARTDATE").fetchall()
+    finally:
+        conn.close()
+    return [(bundle,
+             datetime.fromtimestamp(z_start + APPLE_EPOCH_S, tz=timezone.utc),
+             datetime.fromtimestamp(z_end + APPLE_EPOCH_S, tz=timezone.utc))
+            for bundle, z_start, z_end in rows]
+
+
+def scan_screen(db: sqlite3.Connection,
+                store: Path | None = None) -> tuple[int, list[str]]:
+    store = store or KNOWLEDGE_DB
+    if not store.is_file():
+        return 0, ["screen: no macOS Screen Time store"]
+    try:
+        intervals = read_screen_intervals(store)
+    except sqlite3.Error as exc:
+        return 0, [f"screen: store unreadable ({exc}) — needs Full Disk Access; "
+                   "totals fall back to attributed-only"]
+    say(f"  screen: {len(intervals)} foreground intervals in the Screen Time store")
+    by_bundle: dict[str, list[tuple[datetime, datetime]]] = {}
+    for bundle, start, end in intervals:
+        by_bundle.setdefault(bundle, []).append((start, end))
+    added = 0
+    for bundle, ivs in by_bundle.items():
+        day_secs: dict[str, int] = {}
+        day_count: dict[str, int] = {}
+        day_span: dict[str, list[datetime]] = {}
+        for start, end in merge_intervals(ivs):
+            for day, secs in seconds_by_local_day(start, end).items():
+                day_secs[day] = day_secs.get(day, 0) + secs
+                day_count[day] = day_count.get(day, 0) + 1
+                span = day_span.setdefault(day, [start, end])
+                span[0], span[1] = min(span[0], start), max(span[1], end)
+        for day, secs in day_secs.items():
+            if secs < SCREEN_MIN_APP_DAY_S:
+                continue
+            uid = f"screen:{day}:{bundle}"
+            prev = db.execute("SELECT meta FROM events WHERE uid=?", (uid,)).fetchone()
+            if prev and prev[0] and json.loads(prev[0]).get("seconds") == secs:
+                continue
+            replace_event(db, uid, source="screen", kind="screen",
+                          ts_start=day_span[day][0], ts_end=day_span[day][1],
+                          project=None, items=day_count[day],
+                          meta={"seconds": secs, "day": day, "app": bundle})
+            added += 1
+    db.commit()
+    return added, []
+
+
 # ---------------------------------------------------------------- github
 
 def _gh(args: list[str], timeout: int = 60) -> tuple[int, str]:
@@ -1249,6 +1378,9 @@ def compute_daily(db: sqlite3.Connection) -> dict:
     evidence_days: set[str] = set()
     attributed: dict[str, dict[str, float]] = {}
     proj: dict[str, dict[str, float]] = {}    # project -> {hours, loc_add, loc_del}
+    screen: dict[str, float] = {}             # day -> allowlisted foreground hours
+    screen_apps: dict[str, float] = {}        # bundle id -> total hours
+    screen_include, screen_exclude = load_screen_config()
 
     def bump_proj(p: str | None, h: float = 0, a: int = 0, d: int = 0):
         p = p or "misc"
@@ -1293,6 +1425,15 @@ def compute_daily(db: sqlite3.Connection) -> dict:
             bump_proj(project, a=la, d=ld)
         elif kind == "remote_activity" and day:
             evidence_days.add(day)
+        elif kind == "screen":
+            bundle = meta.get("app") or ""
+            screen_day = meta.get("day") or day
+            secs = int(meta.get("seconds", 0))
+            if not screen_day or not secs or not screen_app_allowed(
+                    bundle, screen_include, screen_exclude):
+                continue
+            screen[screen_day] = screen.get(screen_day, 0.0) + secs / 3600
+            screen_apps[bundle] = screen_apps.get(bundle, 0.0) + secs / 3600
 
     day_proj: dict[str, dict[str, int]] = {}
     for (d, p), cnt in commits_day_proj.items():
@@ -1319,9 +1460,24 @@ def compute_daily(db: sqlite3.Connection) -> dict:
         # co-authored, preserving the conservative fallback.
         bucket["own"] = max(human_h - bucket["coauthored"], 0.0)
 
+    # Screen time is an envelope over foreground work, never an additive
+    # source: per day, only the portion exceeding max(human evidence, shared
+    # AI) is new information ("uncaptured" reading/reviewing/debugging time).
+    for day, screen_h in screen.items():
+        screen_h = min(screen_h, SCREEN_DAY_CAP_H)
+        screen[day] = screen_h
+        bucket = attributed.setdefault(day, {"coauthored": 0.0, "ai_only": 0.0})
+        bucket.setdefault("own", 0.0)
+        foreground = bucket["own"] + bucket["coauthored"]
+        bucket["screen"] = screen_h
+        bucket["uncaptured"] = max(screen_h - foreground, 0.0)
+        if screen_h >= SCREEN_MIN_EVIDENCE_H:
+            evidence_days.add(day)
+
     evidence_days.update(hours)
     return {"hours": hours, "loc": loc, "loc_add": loc_add,
             "commits": commits_per_day, "projects": proj, "attributed": attributed,
+            "screen": screen, "screen_apps": screen_apps,
             "evidence_days": sorted(evidence_days)}
 
 
@@ -1414,6 +1570,8 @@ def builder_profile(db: sqlite3.Connection, agg: dict, evidence_hours: dict[str,
     late = timed = 0
     for source, kind, ts_start, meta_s in db.execute(
             "SELECT source,kind,ts_start,meta FROM events"):
+        if kind == "screen":
+            continue  # envelope data; keeps badge and night-rate math stable
         meta = json.loads(meta_s) if meta_s else {}
         if kind == "session":
             metrics["sessions"] += 1
@@ -1612,6 +1770,26 @@ def summarize(db: sqlite3.Connection) -> dict:
         "your_coding": rounded_your,
         "ai_coding": round(rounded_total - rounded_your, 1),
     }
+    screen_days = agg.get("screen", {})
+    uncaptured_hours = sum(
+        per.get("uncaptured", 0.0) for per in agg["attributed"].values())
+    screen_time = {
+        "available": bool(screen_days),
+        "hours": round(sum(screen_days.values()), 1),
+        "days": len(screen_days),
+        "first_day": min(screen_days) if screen_days else None,
+        "last_day": max(screen_days) if screen_days else None,
+        "uncaptured_hours": round(uncaptured_hours, 1),
+        "your_coding_involved": round(allocation["your_coding"] + uncaptured_hours, 1),
+        "day_cap_hours": SCREEN_DAY_CAP_H,
+        "per_app_hours": {
+            bundle: round(hours_total, 1)
+            for bundle, hours_total in sorted(
+                agg.get("screen_apps", {}).items(), key=lambda kv: -kv[1])[:12]},
+    }
+    total_involved_hours = round(total_hours + uncaptured_hours, 1)
+    involved_formula = ("total_involved(day) = max(human_evidence, shared_ai, "
+                        "screen_coding) + independent_ai")
 
     rows = db.execute("SELECT source, COUNT(*), SUM(loc_add), SUM(loc_del), SUM(items) "
                       "FROM events GROUP BY source").fetchall()
@@ -1675,6 +1853,9 @@ def summarize(db: sqlite3.Connection) -> dict:
             100 * overlap_discount_hours / raw_total_hours, 1)
         if raw_total_hours else 0.0,
         "attributed_hours": attributed_hours,
+        "screen_time": screen_time,
+        "total_involved_hours": total_involved_hours,
+        "involved_formula": involved_formula,
         "coauthor_allocation": {
             "shared_hours": round(evidence_hours["coauthored"], 1),
             "your_base_hours": round(evidence_hours["own"], 1),
@@ -1821,6 +2002,8 @@ def cmd_scan(args) -> None:
                 added, notes = scan_aider(db, roots)
             elif s == "vscode":
                 added, notes = scan_vscode(db)
+            elif s == "screen":
+                added, notes = scan_screen(db)
             elif s == "github":
                 if not local_repo_names:
                     local_repo_names = {r[0].lower() for r in db.execute(
@@ -1894,6 +2077,15 @@ def cmd_status(args) -> None:
     say(f"  shared evidence: {fmt_h(allocation['shared_hours'])} allocated "
         f"{allocation['your_share_pct']}% yours / {allocation['ai_share_pct']}% AI")
     say(f"  raw source sum before overlap discount: {fmt_h(s['raw_total_hours'])}")
+    st = s["screen_time"]
+    if st["available"]:
+        say(f"  screen time in coding apps: {fmt_h(st['hours'])} across "
+            f"{st['days']} days ({st['first_day']} → {st['last_day']})")
+        say(f"  {C_BOLD}total involved: {fmt_h(s['total_involved_hours'])}{C_RESET} "
+            f"= attributed {fmt_h(s['total_hours'])} + screen-verified uncaptured "
+            f"{fmt_h(st['uncaptured_hours'])} (credits to Your Coding)")
+        say(f"  {C_DIM}per day: max(your evidence, shared AI, screen) "
+            f"+ independent AI{C_RESET}")
     say(f"  remaining to journeyman: {fmt_h(s['remaining_hours'])}")
     say("")
     for src, h in s["hours_by_source"].items():
@@ -1950,6 +2142,10 @@ def cmd_report(args) -> None:
     L.append(f"- Timestamp-qualified concurrency discount: "
              f"**−{s['overlap_discount_hours']:,}h "
              f"({s['overlap_discount_pct']}%)**")
+    if s["screen_time"]["available"]:
+        L.append(f"- **Total involved time: {s['total_involved_hours']:,}h** = "
+                 f"attributed {s['total_hours']:,}h + screen-verified uncaptured "
+                 f"{s['screen_time']['uncaptured_hours']:,}h")
     L.append(f"- Local commits: **{s['total_commits']:,}** "
              f"(+{s['loc_added']:,} LOC added, net {s['net_loc']:,})")
     if s["remote_commits"]:
@@ -1972,6 +2168,28 @@ def cmd_report(args) -> None:
     L.append("|--------|------:|-------:|")
     for src, h in s["hours_by_source"].items():
         L.append(f"| {src} | {h:,} | {s['per_source'].get(src, {}).get('events', 0):,} |")
+    st = s["screen_time"]
+    if st["available"]:
+        L.append("\n## Total involved time (screen-verified)\n")
+        L.append(f"Coding-app screen time from the macOS Screen Time store: "
+                 f"**{st['hours']:,}h** across **{st['days']:,}** days "
+                 f"({st['first_day']} → {st['last_day']}). Screen time is an "
+                 f"envelope over foreground work, never an additive source. "
+                 f"Per day:\n")
+        L.append("```text")
+        L.append(s["involved_formula"])
+        L.append("               = attributed_total + uncaptured")
+        L.append("uncaptured     = max(0, screen_hours - max(human_evidence, shared_ai))")
+        L.append("```\n")
+        L.append(f"The **{st['uncaptured_hours']:,}h** uncaptured remainder is "
+                 f"reading, reviewing, and debugging time in coding apps that "
+                 f"produced no commit or agent receipt. It credits to Your "
+                 f"Coding ({st['your_coding_involved']:,}h involved), never to "
+                 f"AI Coding. Days are capped at {st['day_cap_hours']:,}h.\n")
+        L.append("| App | Hours |")
+        L.append("|-----|------:|")
+        for bundle, hours_total in st["per_app_hours"].items():
+            L.append(f"| {bundle} | {hours_total:,} |")
     L.append("\n## Hours by year\n")
     L.append("| Year | Hours |")
     L.append("|------|------:|")
@@ -2167,6 +2385,8 @@ def cmd_doctor(args) -> None:
         ("vscode history", (HOME / "Library/Application Support/Code/User/History").is_dir(),
          ""),
         ("gh CLI", _gh(["auth", "status"])[0] == 0, "github source available"),
+        ("screen time", KNOWLEDGE_DB.is_file(),
+         "macOS app-usage store (bundle ids + durations only)"),
     ]
     say(f"{C_BOLD}coding-ledger doctor{C_RESET}")
     for name, ok, detail in checks:
@@ -2353,7 +2573,7 @@ def render_landing(s: dict) -> str:
         "git": "Git", "claude": "Claude Code", "codex": "Codex",
         "gemini": "Gemini", "antigravity": "Antigravity", "grok": "Grok Build",
         "cursor": "Cursor", "aider": "Aider", "vscode": "VS Code",
-        "github": "GitHub",
+        "github": "GitHub", "screen": "Screen Time",
     }
     source_chips = "".join(
         f"<span>{html.escape(source_names[source])}</span>" for source in ALL_SOURCES)
@@ -2536,6 +2756,25 @@ def render_dashboard(s: dict, daily: dict) -> str:
     recent_rhythm = " → ".join(
         f'{run["days"]} {"on" if run["state"] == "building" else "off"}'
         for run in recent_runs)
+    st = s["screen_time"]
+    if st["available"]:
+        screen_card = f"""<article class="metric wide"><div class="eyebrow">Total involved time</div>
+<div class="number">{s['total_involved_hours']:,}h</div>
+<small>Attributed {s['total_hours']:,}h + screen-verified uncaptured {st['uncaptured_hours']:,}h
+from {st['hours']:,}h in coding apps over {st['days']:,} days · per day:
+max(your evidence, shared AI, screen) + independent AI</small>
+<div class="duo"><div><span>Your Coding, involved</span><b>{st['your_coding_involved']:,}h</b></div>
+<div><span>Screen window</span><b>{html.escape(str(st['first_day']))} → {html.escape(str(st['last_day']))}</b></div></div></article>"""
+        screen_method = (
+            " Screen time from the macOS Screen Time store is an envelope over "
+            "foreground work, never an additive source: per day, only "
+            "max(0, screen − max(human evidence, shared AI)) is added as "
+            "screen-verified uncaptured time, credited to Your Coding. Only app "
+            "bundle identifiers and durations are read — never window titles, "
+            "documents, or URLs.")
+    else:
+        screen_card = ""
+        screen_method = ""
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -2606,6 +2845,7 @@ h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
 <small>+{s['loc_added']:,} LOC · net {s['net_loc']:,}</small></article>
 <article class="metric"><div class="eyebrow">AI sessions</div><div class="number">{s['sessions']:,}</div>
 <small>Claude · Codex · Gemini · Grok · Cursor · Aider</small></article>
+{screen_card}
 </section>
 <article class="panel"><h2>Workflow analytics</h2><div class="insights">{analytics_cards}</div></article>
 <article class="panel"><h2>Building rhythm</h2><div class="rhythm-stats">
@@ -2626,7 +2866,7 @@ h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
 <tbody>{project_rows}</tbody></table></article></section>
 <article class="panel method"><h2>How attribution works</h2><p>The scorecard has two categories: Your Coding and AI Coding.
 Shared work is allocated between them using the ratio of measured human-only to AI-only base hours ({s['coauthor_allocation']['your_share_pct']}% yours / {s['coauthor_allocation']['ai_share_pct']}% AI).
-Only AI activity inside the ten-minute window after an explicit human steering turn is eligible to overlap human Git/editor evidence. Independently running AI time remains additive; sources without steering detail default conservatively to shared work. GitHub aggregates add commits and LOC but never synthetic hours. Badge thresholds are visible and reproducible.
+Only AI activity inside the ten-minute window after an explicit human steering turn is eligible to overlap human Git/editor evidence. Independently running AI time remains additive; sources without steering detail default conservatively to shared work. GitHub aggregates add commits and LOC but never synthetic hours. Badge thresholds are visible and reproducible.{screen_method}
 Transcript bodies, prompts, secrets, and tool output are not stored.</p></article>
 <footer><span>ALL DATA LOCAL</span><span>{s['active_days']} ACTIVE DAYS / BEST STREAK {s['best_streak']}D</span></footer>
 </main><script>

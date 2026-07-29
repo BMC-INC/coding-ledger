@@ -25,6 +25,10 @@ class LedgerTestCase(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.db_path = self.root / "ledger.db"
         self.db = ledger.open_db(self.db_path)
+        patcher = mock.patch.object(
+            ledger, "SCREEN_APPS_CONFIG", self.root / "screen_apps.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.db.close()
@@ -475,6 +479,186 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("on /", public)
         self.assertNotIn("widget", public)
         self.assertNotIn("SECRET", public)
+
+    def _write_screen_store(self, rows):
+        store = self.root / "knowledgeC.db"
+        con = sqlite3.connect(store)
+        con.execute(
+            "CREATE TABLE IF NOT EXISTS ZOBJECT "
+            "(ZSTREAMNAME TEXT, ZVALUESTRING TEXT, ZSTARTDATE REAL, ZENDDATE REAL)")
+        con.executemany(
+            "INSERT INTO ZOBJECT VALUES ('/app/usage',?,?,?)", rows)
+        con.commit()
+        con.close()
+        return store
+
+    @staticmethod
+    def _apple(ts):
+        return ts.timestamp() - ledger.APPLE_EPOCH_S
+
+    def test_screen_interval_helpers_merge_and_split_at_midnight(self):
+        base = datetime(2026, 1, 1, 10, tzinfo=timezone.utc)
+        merged = ledger.merge_intervals([
+            (base, base + timedelta(hours=1)),
+            (base + timedelta(minutes=30), base + timedelta(hours=2)),
+            (base + timedelta(hours=3), base + timedelta(hours=4)),
+        ])
+        self.assertEqual(merged, [
+            (base, base + timedelta(hours=2)),
+            (base + timedelta(hours=3), base + timedelta(hours=4)),
+        ])
+        start = datetime(2026, 1, 1, 23, 59, 0).astimezone()
+        split = ledger.seconds_by_local_day(start, start + timedelta(minutes=2))
+        self.assertEqual(len(split), 2)
+        self.assertEqual(sum(split.values()), 120)
+
+    def test_screen_scan_persists_all_apps_and_is_idempotent(self):
+        start = datetime(2026, 1, 5, 12, tzinfo=timezone.utc)
+        rows = [
+            ("com.apple.Terminal", self._apple(start),
+             self._apple(start + timedelta(hours=2))),
+            # overlaps the first interval — must merge, not double count
+            ("com.apple.Terminal", self._apple(start + timedelta(hours=1)),
+             self._apple(start + timedelta(hours=1, minutes=30))),
+            ("com.apple.Safari", self._apple(start + timedelta(hours=3)),
+             self._apple(start + timedelta(hours=6))),
+        ]
+        store = self._write_screen_store(rows)
+        added, notes = ledger.scan_screen(self.db, store=store)
+        self.assertEqual(notes, [])
+        self.assertEqual(added, 2)
+        day = ledger.local_day(start)
+        meta = json.loads(self.db.execute(
+            "SELECT meta FROM events WHERE uid=?",
+            (f"screen:{day}:com.apple.Terminal",)).fetchone()[0])
+        self.assertEqual(meta["seconds"], 7200)
+        # Safari is persisted (allowlist filtering happens at aggregation)
+        self.assertIsNotNone(self.db.execute(
+            "SELECT 1 FROM events WHERE uid=?",
+            (f"screen:{day}:com.apple.Safari",)).fetchone())
+        added, _ = ledger.scan_screen(self.db, store=store)
+        self.assertEqual(added, 0)
+
+    def test_screen_missing_store_reports_note(self):
+        added, notes = ledger.scan_screen(self.db, store=self.root / "missing.db")
+        self.assertEqual(added, 0)
+        self.assertEqual(len(notes), 1)
+
+    def test_screen_envelope_adds_only_uncaptured_time(self):
+        start = datetime(2026, 1, 5, 12, tzinfo=timezone.utc)
+        day = ledger.local_day(start)
+        ledger.insert_event(
+            self.db, "codex:screen-test", "codex", "session", start,
+            start + timedelta(hours=3), "widget",
+            meta={"active_s": 10800, "days": {day: 10800},
+                  "coauthored_s": 7200, "ai_only_s": 3600})
+        ledger.insert_event(
+            self.db, f"screen:{day}:com.apple.Terminal", "screen", "screen",
+            start, start + timedelta(hours=6), None, items=3,
+            meta={"seconds": 6 * 3600, "day": day, "app": "com.apple.Terminal"})
+        # Safari never counts toward the envelope under the default allowlist
+        ledger.insert_event(
+            self.db, f"screen:{day}:com.apple.Safari", "screen", "screen",
+            start, start + timedelta(hours=8), None, items=1,
+            meta={"seconds": 8 * 3600, "day": day, "app": "com.apple.Safari"})
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        # attributed/day = max(0 human, 2h shared) + 1h independent = 3h;
+        # screen 6h - foreground 2h = 4h uncaptured; involved = 3 + 4 = 7
+        self.assertEqual(summary["total_hours"], 3)
+        st = summary["screen_time"]
+        self.assertTrue(st["available"])
+        self.assertEqual(st["hours"], 6)
+        self.assertEqual(st["uncaptured_hours"], 4)
+        self.assertEqual(summary["total_involved_hours"], 7)
+        self.assertEqual(st["your_coding_involved"], 4)
+        self.assertEqual(st["per_app_hours"], {"com.apple.Terminal": 6})
+        self.assertIn("screen_coding", summary["involved_formula"])
+        summary["scan_state"] = "complete"
+        summary["completed_scans"] = 1
+        daily = summary.pop("_daily")
+        rendered = ledger.render_dashboard(summary, daily)
+        self.assertIn("Total involved time", rendered)
+        self.assertIn("screen-verified uncaptured", rendered)
+        self.assertIn("envelope over", rendered)
+
+    def test_screen_smaller_than_receipts_adds_nothing(self):
+        start = datetime(2026, 1, 5, 12, tzinfo=timezone.utc)
+        day = ledger.local_day(start)
+        ledger.insert_event(
+            self.db, "codex:covered", "codex", "session", start,
+            start + timedelta(hours=3), "widget",
+            meta={"active_s": 10800, "days": {day: 10800},
+                  "coauthored_s": 10800, "ai_only_s": 0})
+        ledger.insert_event(
+            self.db, f"screen:{day}:com.apple.Terminal", "screen", "screen",
+            start, start + timedelta(hours=1), None, items=1,
+            meta={"seconds": 3600, "day": day, "app": "com.apple.Terminal"})
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        self.assertEqual(summary["screen_time"]["uncaptured_hours"], 0)
+        self.assertEqual(
+            summary["total_involved_hours"], summary["total_hours"])
+
+    def test_screen_day_cap_and_evidence_floor(self):
+        day_a = "2026-01-05"
+        start_a = datetime(2026, 1, 5, 12, tzinfo=timezone.utc)
+        ledger.insert_event(
+            self.db, f"screen:{day_a}:com.apple.Terminal", "screen", "screen",
+            start_a, start_a + timedelta(hours=20), None, items=1,
+            meta={"seconds": 20 * 3600, "day": day_a, "app": "com.apple.Terminal"})
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        self.assertEqual(summary["screen_time"]["hours"], 18)
+        self.assertEqual(summary["total_involved_hours"], 18)
+        self.assertEqual(summary["active_days"], 1)
+        # a sub-15-minute day contributes hours but never an active day
+        self.db.execute("DELETE FROM events")
+        start_b = datetime(2026, 1, 6, 12, tzinfo=timezone.utc)
+        day_b = "2026-01-06"
+        ledger.insert_event(
+            self.db, f"screen:{day_b}:com.apple.Terminal", "screen", "screen",
+            start_b, start_b + timedelta(minutes=12), None, items=1,
+            meta={"seconds": 720, "day": day_b, "app": "com.apple.Terminal"})
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        self.assertEqual(summary["active_days"], 0)
+        self.assertEqual(summary["total_involved_hours"], 0.2)
+
+    def test_screen_config_overrides_allowlist(self):
+        (self.root / "screen_apps.json").write_text(json.dumps({
+            "include": ["com.apple.Safari"], "exclude": []}))
+        start = datetime(2026, 1, 5, 12, tzinfo=timezone.utc)
+        day = ledger.local_day(start)
+        for bundle in ("com.apple.Terminal", "com.apple.Safari"):
+            ledger.insert_event(
+                self.db, f"screen:{day}:{bundle}", "screen", "screen",
+                start, start + timedelta(hours=1), None, items=1,
+                meta={"seconds": 3600, "day": day, "app": bundle})
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        self.assertEqual(
+            summary["screen_time"]["per_app_hours"], {"com.apple.Safari": 1})
+
+    def test_report_states_involved_formula_explicitly(self):
+        start = datetime(2026, 1, 5, 12, tzinfo=timezone.utc)
+        day = ledger.local_day(start)
+        ledger.insert_event(
+            self.db, f"screen:{day}:com.apple.Terminal", "screen", "screen",
+            start, start + timedelta(hours=2), None, items=1,
+            meta={"seconds": 7200, "day": day, "app": "com.apple.Terminal"})
+        self.db.commit()
+        out = self.root / "report.md"
+        args = argparse.Namespace(db=self.db_path, format="markdown", out=str(out))
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            ledger.cmd_report(args)
+        report = out.read_text()
+        self.assertIn("Total involved time", report)
+        self.assertIn(
+            "total_involved(day) = max(human_evidence, shared_ai, "
+            "screen_coding) + independent_ai", report)
+        self.assertIn("uncaptured", report)
 
     def test_project_diversity_compares_multi_project_momentum(self):
         start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
