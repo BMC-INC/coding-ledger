@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Coding Ledger — Know what your AI actually returns</title>
+<meta name="description" content="Local-first AI coding ROI. Token spend from Claude Code and Codex logs, priced at API list rates, tied to shipped commits. Screen-time verified hours. Zero dependencies, no prompts or code ever stored. By ExecLayer Inc.">
+<link rel="canonical" href="https://coding-ledger.vercel.app/">
+<meta property="og:title" content="Coding Ledger — Know what your AI actually returns">
+<meta property="og:description" content="Local-first AI coding ROI: token spend from Claude Code and Codex logs tied to shipped commits. Free to scan. By ExecLayer Inc.">
+<meta property="og:image" content="https://coding-ledger.vercel.app/roi-card.png">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23d8ff4f'/%3E%3Ctext x='13' y='45' font-size='40'%3EC%3C/text%3E%3C/svg%3E">
+<style>
+:root{--paper:#f0eadb;--ink:#17211d;--muted:#6d7167;--acid:#d8ff4f;--navy:#16324f;--rule:#b9b39f}
+*{box-sizing:border-box;margin:0}
+body{background:var(--paper);color:var(--ink);font:16px/1.6 "SFMono-Regular","Cascadia Mono",ui-monospace,monospace;
+background-image:linear-gradient(rgba(23,33,29,.045) 1px,transparent 1px);background-size:100% 28px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+.eyebrow{text-transform:uppercase;letter-spacing:.16em;font-size:12px}
+.topline{display:flex;justify-content:space-between;gap:12px;border-top:3px solid var(--ink);border-bottom:1px solid var(--ink);padding:12px 0;margin-top:20px;flex-wrap:wrap}
+h1{font:800 clamp(44px,8vw,100px)/.88 "Iowan Old Style","Palatino Linotype",Palatino,serif;letter-spacing:-.05em;margin:34px 0 10px;text-transform:uppercase}
+.sub{max-width:640px;color:var(--muted)}
+h2{font:700 clamp(24px,3.4vw,34px)/1.1 "Iowan Old Style","Palatino Linotype",serif;margin:0 0 16px}
+.install{background:var(--navy);color:#fff;border:1px solid var(--ink);box-shadow:8px 8px 0 var(--acid);padding:26px;margin:36px 0}
+.install code{display:block;font-size:clamp(14px,2.4vw,19px);padding:4px 0;overflow-x:auto;white-space:pre}
+.install .c{color:#8fa2aa}
+section{margin:64px 0}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px}
+.card{border:1px solid var(--ink);background:rgba(255,255,255,.35);box-shadow:5px 5px 0 var(--ink);padding:22px}
+.card b{font:700 22px "Iowan Old Style",serif;display:block;margin-bottom:8px}
+.card p{font-size:14px;color:var(--muted)}
+.proof{border:1px solid var(--ink);box-shadow:8px 8px 0 var(--ink);max-width:640px;width:100%;height:auto;display:block;margin:24px auto 8px}
+.cap{text-align:center;color:var(--muted);font-size:13px}
+pre.formula{background:rgba(23,33,29,.06);border:1px solid var(--rule);padding:18px;overflow-x:auto;font-size:14px;line-height:1.7}
+.pricing{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px}
+.tier{border:1px solid var(--ink);box-shadow:5px 5px 0 var(--ink);padding:26px;background:rgba(255,255,255,.35)}
+.tier.pro{background:var(--navy);color:#fff;box-shadow:5px 5px 0 var(--acid)}
+.tier h3{font:700 26px "Iowan Old Style",serif;margin-bottom:4px}
+.tier .price{font:800 44px "Iowan Old Style",serif;margin:10px 0}
+.tier .price small{font-size:16px;font-weight:400}
+.tier ul{list-style:none;padding:0;margin:14px 0;font-size:14px}
+.tier li{padding:5px 0;border-top:1px dotted var(--rule)}
+.tier.pro li{border-top:1px dotted #657984}
+.btn{display:inline-block;background:var(--acid);color:var(--ink);border:1px solid var(--ink);padding:12px 22px;margin:8px 8px 0 0;font:inherit;font-weight:700;text-decoration:none;box-shadow:4px 4px 0 var(--ink)}
+.btn:active{transform:translate(2px,2px);box-shadow:2px 2px 0 var(--ink)}
+.btn.ghost{background:transparent}
+.tier.pro .btn.ghost{color:#fff;border-color:#fff;box-shadow:4px 4px 0 rgba(216,255,79,.5)}
+.never{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:14px}
+.never span{border:1px solid var(--rule);padding:10px 14px;font-size:13px;color:var(--muted)}
+.never span::before{content:"✕ ";color:#e76f51;font-weight:700}
+table{border-collapse:collapse;width:100%;font-size:13px;margin-top:14px}
+th,td{text-align:left;border-top:1px solid var(--rule);padding:8px 10px 8px 0}
+th{text-transform:uppercase;letter-spacing:.1em;font-size:11px}
+footer{border-top:2px solid var(--ink);padding:22px 0 40px;margin-top:70px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:13px}
+footer a{color:inherit}
+a{color:var(--navy)}
+.linkrow a{margin-right:22px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="topline">
+  <span class="eyebrow">Coding Ledger</span>
+  <span class="eyebrow">By ExecLayer Inc.</span>
+</div>
+
+<h1>Know what<br>your AI<br>actually returns.</h1>
+<p class="sub">Coding Ledger reads the receipts already on your machine, Git history,
+Claude Code and Codex session logs, macOS Screen Time, and turns them into an
+evidence-backed record of your work and your AI's ROI. Everything runs locally.
+Nothing leaves your machine.</p>
+
+<div class="install">
+  <code><span class="c"># install (Python 3.10+, zero dependencies)</span>
+pipx install coding-ledger
+<span class="c"># or</span>
+brew tap BMC-INC/coding-ledger && brew install coding-ledger
+
+<span class="c"># run</span>
+coding-ledger init --author "Your Name,you@example.com"
+coding-ledger scan --roots "$HOME/Projects"
+coding-ledger roi</code>
+</div>
+
+<section>
+  <h2>Three questions no other tool answers together</h2>
+  <div class="grid3">
+    <div class="card"><b>What did your AI cost?</b>
+      <p>Token usage read straight from local Claude Code and Codex logs, priced
+      at API list rates. API-equivalent value, what it would have cost, not what
+      you paid on a subscription. Unknown models are labeled unpriced, never guessed.</p></div>
+    <div class="card"><b>What did it return?</b>
+      <p>Spend tied to shipped commits and merged PRs: cost per shipped commit,
+      conversion rate per tool, unconverted spend, monthly trends, and your
+      subscription ROI multiple.</p></div>
+    <div class="card"><b>How do you actually work?</b>
+      <p>Human-versus-AI attribution, total involved time verified against
+      Screen Time, streaks, badges, and a shareable builder field report.</p></div>
+  </div>
+</section>
+
+<section>
+  <h2>Real numbers, reproducible math</h2>
+  <img class="proof" src="roi-card.png" alt="AI ROI share card: $4,080 API-equivalent spend, $2.00 per shipped commit across 2,044 commits" width="1200" height="1350">
+  <p class="cap">An actual Pro share card. Aggregate evidence only: no prompts, no code, no project names.</p>
+</section>
+
+<section>
+  <h2>Hours you can defend</h2>
+  <p class="sub">Screen time overlaps git, editor, and steering evidence, so it is an
+  envelope, never blindly added. The formula is printed everywhere the number appears:</p>
+  <pre class="formula">screen_hours   = allowlisted foreground seconds / 3600 (18h/day cap)
+uncaptured     = max(0, screen_hours - max(human_evidence, shared_ai))
+total_involved = max(human_evidence, shared_ai, screen_hours) + independent_ai
+               = attributed_total + uncaptured</pre>
+  <p class="sub">Uncaptured is the reading, reviewing, and debugging time in coding
+  apps that produced no receipt. It credits to you, never to AI.</p>
+</section>
+
+<section>
+  <h2>Private by construction</h2>
+  <p class="sub">The ledger is a local SQLite file. It stores timestamps, counts, and
+  aggregates. It never stores:</p>
+  <div class="never">
+    <span>prompts or responses</span>
+    <span>source code</span>
+    <span>tool arguments or output</span>
+    <span>credentials or API keys</span>
+    <span>window titles or URLs</span>
+    <span>anything phoned home</span>
+  </div>
+</section>
+
+<section>
+  <h2>Pricing</h2>
+  <div class="pricing">
+    <div class="tier">
+      <h3>Free</h3>
+      <div class="price">$0</div>
+      <ul>
+        <li>All 11 source scanners and the SQLite ledger</li>
+        <li>roi, today, status, full JSON and markdown reports</li>
+        <li>Offline dashboard with headline ROI totals</li>
+        <li>Public scorecard exports (HTML, PDF, social image)</li>
+      </ul>
+      <a class="btn ghost" href="https://github.com/BMC-INC/coding-ledger">GitHub →</a>
+    </div>
+    <div class="tier pro">
+      <h3>Pro</h3>
+      <div class="price">$49<small>/year</small> <small>or</small> $99 <small>lifetime</small></div>
+      <ul>
+        <li>Dashboard ROI deep-dive: per-tool, per-model, per-project</li>
+        <li>Monthly trend chart and unconverted-spend view</li>
+        <li>The AI ROI share card export</li>
+        <li>Offline Ed25519 license. No phone-home, ever.</li>
+      </ul>
+      <a class="btn" href="https://buy.stripe.com/4gMeVd3PA3Oc3Ut0eQ6c000">Buy yearly $49</a>
+      <a class="btn" href="https://buy.stripe.com/7sY7sLeue70o9eNe5G6c001">Early lifetime $99</a>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Eleven sources, one ledger</h2>
+  <table>
+    <tr><th>Source</th><th>Receipt</th></tr>
+    <tr><td>Git</td><td>Author-filtered commits, SHA, timestamps, LOC</td></tr>
+    <tr><td>Claude Code</td><td>Session metadata and token usage</td></tr>
+    <tr><td>Codex</td><td>Session metadata and token usage</td></tr>
+    <tr><td>Gemini, Grok, Cursor, Aider</td><td>Session metadata</td></tr>
+    <tr><td>VS Code, Antigravity</td><td>Edit-level activity proxies</td></tr>
+    <tr><td>GitHub</td><td>Remote-only commits and LOC, merged PRs</td></tr>
+    <tr><td>Screen Time</td><td>Per-app foreground intervals, bundle ids and durations only</td></tr>
+  </table>
+</section>
+
+<footer>
+  <span class="linkrow">
+    <a href="https://github.com/BMC-INC/coding-ledger">GitHub</a>
+    <a href="https://pypi.org/project/coding-ledger/">PyPI</a>
+    <a href="https://github.com/BMC-INC/coding-ledger/blob/main/LICENSE">Elastic License 2.0</a>
+  </span>
+  <span>© 2026 ExecLayer Inc. Source-available, local-first, no telemetry.</span>
+</footer>
+
+</div>
+</body>
+</html>
