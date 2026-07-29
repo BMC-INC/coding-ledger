@@ -3022,14 +3022,31 @@ def cmd_export(args) -> None:
                       "--window-size=1200,1350", "--force-device-scale-factor=1",
                       f"--screenshot={image_path}", html_path.as_uri()],
             image_path)
+        roi_card_ok = None
+        roi_card_path = output_dir / "coding-ledger-roi-card.png"
+        if summary["ai_spend"]["available"] and license_state()["plan"] == "pro":
+            roi_html_path = output_dir / "coding-ledger-roi-card.html"
+            roi_html_path.write_text(render_roi_card(summary, builder_name))
+            roi_card_ok = run_chromium_export(
+                common + [f"--user-data-dir={temp_root}/roi",
+                          "--window-size=1200,1350",
+                          "--force-device-scale-factor=1",
+                          f"--screenshot={roi_card_path}", roi_html_path.as_uri()],
+                roi_card_path)
     failures = [
-        label for label, ok in (("PDF", pdf_ok), ("LinkedIn image", image_ok))
-        if not ok]
+        label for label, ok in (("PDF", pdf_ok), ("LinkedIn image", image_ok),
+                                ("ROI card", roi_card_ok))
+        if ok is False]
     if failures:
         raise SystemExit(f"Export failed: {', '.join(failures)}")
     say(f"{C_GREEN}✓ public scorecard HTML{C_RESET}: {html_path}")
     say(f"{C_GREEN}✓ shareable PDF{C_RESET}: {pdf_path}")
     say(f"{C_GREEN}✓ LinkedIn image{C_RESET}: {image_path}")
+    if roi_card_ok:
+        say(f"{C_GREEN}✓ AI ROI share card{C_RESET}: {roi_card_path}")
+    elif summary["ai_spend"]["available"] and roi_card_ok is None:
+        say(f"  {C_DIM}AI ROI share card is a Pro export "
+            f"(license install <file>){C_RESET}")
 
 
 def cmd_doctor(args) -> None:
@@ -3631,6 +3648,83 @@ if(D.roi){{new Chart(document.getElementById("roiChart"),{{data:{{labels:D.roi.m
 options:{{maintainAspectRatio:false,scales:{{y:{{position:"left",title:{{display:true,text:"$"}}}},
 y1:{{position:"right",grid:{{drawOnChartArea:false}},title:{{display:true,text:"commits"}}}}}}}}}});}}
 </script></body></html>"""
+
+
+def render_roi_card(s: dict, builder_name: str) -> str:
+    """1200x1350 public-safe AI ROI share card (Pro export). No project names."""
+    sp, roi = s["ai_spend"], s["roi"]
+    totals = roi["totals"]
+    per_commit = (f"${totals['usd_per_commit']:,.2f}"
+                  if totals["usd_per_commit"] is not None else "—")
+    months = list(roi["by_month"].items())[-6:]
+    max_spend = max((entry["spend_usd"] for _, entry in months), default=0) or 1
+    month_bars = "".join(
+        f"""<div class="bar"><div class="fill" style="height:{max(4, round(100 * entry['spend_usd'] / max_spend))}%"></div>
+<span>{month[2:].replace('-', '/')}</span><b>${entry['spend_usd']:,.0f}</b></div>"""
+        for month, entry in months)
+    tool_rows = "".join(
+        f"<div class='toolrow'><span>{html.escape(source)}</span>"
+        f"<i></i><b>${entry['spend_usd']:,.0f}</b>"
+        f"<em>{entry['conversion_pct']}% converted</em></div>"
+        for source, entry in list(roi["by_source"].items())[:4])
+    model_rows = "".join(
+        f"<div class='toolrow'><span>{html.escape(model)}</span><i></i>"
+        f"<b>${usd:,.0f}</b></div>"
+        for model, usd in list(sp["by_model"].items())[:3])
+    multiple = (f"{sp['subscription_roi_multiple']}x"
+                if sp["subscription_roi_multiple"] else "—")
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>AI ROI — {html.escape(builder_name)}</title>
+<style>
+:root{{--paper:#f0eadb;--ink:#17211d;--muted:#6d7167;--acid:#d8ff4f;--navy:#16324f;--red:#e76f51}}
+*{{box-sizing:border-box;margin:0}}body{{width:1200px;height:1350px;overflow:hidden;background:var(--paper);
+color:var(--ink);font:16px/1.5 "SFMono-Regular","Cascadia Mono",monospace;padding:56px;display:flex;flex-direction:column;
+background-image:linear-gradient(rgba(23,33,29,.045) 1px,transparent 1px);background-size:100% 28px}}
+h1{{font:800 92px/.85 "Iowan Old Style","Palatino Linotype",serif;letter-spacing:-.05em;margin:18px 0 6px}}
+.eyebrow{{text-transform:uppercase;letter-spacing:.16em;font-size:13px}}
+.topline{{display:flex;justify-content:space-between;border-top:3px solid var(--ink);border-bottom:1px solid var(--ink);padding:10px 0}}
+.big{{background:var(--navy);color:#fff;border:1px solid var(--ink);box-shadow:8px 8px 0 var(--acid);padding:30px;margin:26px 0}}
+.big .number{{font:800 120px/1 "Iowan Old Style","Palatino Linotype",serif;letter-spacing:-.05em}}
+.big small{{color:#b9c4c8;font-size:15px}}
+.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-bottom:24px}}
+.stat{{border:1px solid var(--ink);background:rgba(240,234,219,.9);box-shadow:5px 5px 0 var(--ink);padding:18px}}
+.stat b{{font:800 44px/1 "Iowan Old Style","Palatino Linotype",serif;display:block;margin:10px 0 4px}}
+.stat span{{color:var(--muted);font-size:13px}}
+.row{{display:grid;grid-template-columns:1.2fr 1fr;gap:16px;flex:1;min-height:0}}
+.panel{{border:1px solid var(--ink);padding:20px;background:rgba(240,234,219,.9);box-shadow:5px 5px 0 var(--ink)}}
+.panel h2{{font:700 26px "Iowan Old Style",serif;margin-bottom:14px}}
+.bars{{display:flex;gap:14px;align-items:flex-end;height:230px}}
+.bar{{flex:1;display:flex;flex-direction:column;justify-content:flex-end;height:100%;text-align:center}}
+.bar .fill{{background:var(--navy);border:1px solid var(--ink)}}
+.bar span{{font-size:12px;color:var(--muted);margin-top:6px}}.bar b{{font-size:13px}}
+.toolrow{{display:flex;align-items:baseline;gap:10px;border-top:1px solid #b9b39f;padding:10px 0}}
+.toolrow i{{flex:1;border-bottom:2px dotted #b9b39f}}
+.toolrow b{{font-size:20px}}.toolrow em{{color:var(--muted);font-style:normal;font-size:12px}}
+footer{{display:flex;justify-content:space-between;border-top:2px solid var(--ink);padding-top:12px;margin-top:22px;color:var(--muted);font-size:13px}}
+</style></head><body>
+<div class="topline"><span class="eyebrow">Coding Ledger / AI ROI Report</span>
+<span class="eyebrow">{html.escape(s['generated_at'][:10])}</span></div>
+<h1>WHAT MY AI<br>ACTUALLY RETURNS.</h1>
+<div class="eyebrow">{html.escape(builder_name)} · local receipts, reproducible math</div>
+<div class="big"><div class="eyebrow" style="color:#b9c4c8">AI spend, API-equivalent</div>
+<div class="number">${totals['spend_usd']:,.0f}</div>
+<small>What the tokens would cost at list prices — not what was paid. Subscription ROI: {multiple}.</small></div>
+<div class="grid">
+<div class="stat"><span class="eyebrow">Cost / shipped commit</span><b>{per_commit}</b>
+<span>{totals['commits']:,} local commits</span></div>
+<div class="stat"><span class="eyebrow">Converted spend</span><b>${totals['converted_spend_usd']:,.0f}</b>
+<span>commit in project within {roi['window_days']} days</span></div>
+<div class="stat"><span class="eyebrow">Unconverted spend</span><b>${totals['unconverted_spend_usd']:,.0f}</b>
+<span>{totals['unconverted_pct']}% of tracked spend</span></div>
+</div>
+<div class="row">
+<div class="panel"><h2>Spend by month</h2><div class="bars">{month_bars}</div></div>
+<div class="panel"><h2>By tool</h2>{tool_rows}<h2 style="margin-top:18px">Top models</h2>{model_rows}</div>
+</div>
+<footer><span>CODING-LEDGER · LOCAL-FIRST · NO PROMPTS OR CODE STORED</span>
+<span>API-EQUIVALENT LIST PRICES</span></footer>
+</body></html>"""
 
 
 def render_public_scorecard(s: dict, builder_name: str) -> str:

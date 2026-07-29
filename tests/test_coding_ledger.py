@@ -1011,6 +1011,20 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn('"roi":null', free_html)
         self.assertIn("license install", free_html)
 
+    def test_roi_share_card_is_public_safe(self):
+        self._seed_roi_events()
+        summary = ledger.summarize(self.db)
+        card = ledger.render_roi_card(summary, "Test Builder")
+        self.assertIn("WHAT MY AI", card)
+        self.assertIn("Test Builder", card)
+        self.assertIn("not what was paid", card)
+        self.assertIn("Unconverted spend", card)
+        self.assertIn("claude", card)
+        # public-safe: project names never appear
+        self.assertNotIn("widget", card)
+        self.assertNotIn("orphan", card)
+        self.assertNotIn("SECRET", card)
+
     def test_project_diversity_compares_multi_project_momentum(self):
         start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
         for offset, project in ((0, "alpha"), (24, "alpha"), (25, "beta")):
