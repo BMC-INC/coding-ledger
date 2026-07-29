@@ -38,6 +38,7 @@ import argparse
 import base64
 import bisect
 import fnmatch
+import hashlib
 import html
 import json
 import os
@@ -1509,6 +1510,174 @@ def sum_token_buckets(token_models: dict[str, dict]) -> dict[str, int]:
     return total
 
 
+# ---------------------------------------------------------------- pro license
+# Offline, honor-based Pro license: a base64url(payload_json).base64url(sig)
+# string verified with Ed25519 against the embedded public key. Rendering-only
+# gating, no network calls. The vendored curve math below is the public-domain
+# reference implementation, verify-only; signing lives in tools/sign_license.py
+# and the private key never enters the repo.
+
+LICENSE_PATH = LEDGER_DIR / "license.json"
+LICENSE_PUBKEY_HEX = "ed3908727b13a8bc31638d05c1246f7ca9b2a41b87bd1d7b9dfd270f5ed8e105"
+
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_xrecover(y: int) -> int:
+    xx = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P)
+    x = pow(xx, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - xx) % _ED_P != 0:
+        x = x * _ED_I % _ED_P
+    if x % 2 != 0:
+        x = _ED_P - x
+    return x
+
+
+_ED_BY = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_B = (_ed_xrecover(_ED_BY) % _ED_P, _ED_BY % _ED_P)
+
+
+def _ed_add(point_p: tuple[int, int], point_q: tuple[int, int]) -> tuple[int, int]:
+    x1, y1 = point_p
+    x2, y2 = point_q
+    product = _ED_D * x1 * x2 * y1 * y2
+    x3 = (x1 * y2 + x2 * y1) * pow(1 + product, _ED_P - 2, _ED_P)
+    y3 = (y1 * y2 + x1 * x2) * pow(1 - product, _ED_P - 2, _ED_P)
+    return x3 % _ED_P, y3 % _ED_P
+
+
+def _ed_scalarmult(point: tuple[int, int], e: int) -> tuple[int, int]:
+    result = (0, 1)
+    while e:
+        if e & 1:
+            result = _ed_add(result, point)
+        point = _ed_add(point, point)
+        e >>= 1
+    return result
+
+
+def _ed_encodepoint(point: tuple[int, int]) -> bytes:
+    x, y = point
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_isoncurve(point: tuple[int, int]) -> bool:
+    x, y = point
+    return (-x * x + y * y - 1 - _ED_D * x * x * y * y) % _ED_P == 0
+
+
+def _ed_decodepoint(s: bytes) -> tuple[int, int]:
+    raw = int.from_bytes(s, "little")
+    y = raw & ((1 << 255) - 1)
+    x = _ed_xrecover(y)
+    if x & 1 != (raw >> 255) & 1:
+        x = _ED_P - x
+    point = (x, y)
+    if not _ed_isoncurve(point):
+        raise ValueError("point not on curve")
+    return point
+
+
+def ed25519_verify(sig: bytes, msg: bytes, pubkey: bytes) -> bool:
+    if len(sig) != 64 or len(pubkey) != 32:
+        return False
+    try:
+        point_r = _ed_decodepoint(sig[:32])
+        point_a = _ed_decodepoint(pubkey)
+    except ValueError:
+        return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= _ED_L:
+        return False
+    digest = hashlib.sha512(sig[:32] + pubkey + msg).digest()
+    h = int.from_bytes(digest, "little") % _ED_L
+    return _ed_scalarmult(_ED_B, s) == _ed_add(point_r, _ed_scalarmult(point_a, h))
+
+
+def _b64url_decode(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def parse_license(text: str) -> tuple[dict, bytes, bytes] | None:
+    text = "".join(text.split())
+    if text.count(".") != 1:
+        return None
+    payload_b64, sig_b64 = text.split(".")
+    try:
+        payload_bytes = _b64url_decode(payload_b64)
+        sig = _b64url_decode(sig_b64)
+        payload = json.loads(payload_bytes)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload, payload_bytes, sig
+
+
+def license_state(license_text: str | None = None, pubkey_hex: str | None = None,
+                  today: str | None = None) -> dict:
+    """Verify the stored (or given) license; anything short of valid is free."""
+    if license_text is None:
+        try:
+            license_text = LICENSE_PATH.read_text()
+        except OSError:
+            return {"plan": "free", "status": "no license installed"}
+    parsed = parse_license(license_text)
+    if not parsed:
+        return {"plan": "free", "status": "invalid license format"}
+    payload, payload_bytes, sig = parsed
+    try:
+        pubkey = bytes.fromhex(pubkey_hex or LICENSE_PUBKEY_HEX)
+    except ValueError:
+        pubkey = b""
+    if not ed25519_verify(sig, payload_bytes, pubkey):
+        return {"plan": "free", "status": "signature verification failed"}
+    today = today or datetime.now().astimezone().strftime("%Y-%m-%d")
+    expires = payload.get("expires")
+    if expires and str(expires) < today:
+        return {"plan": "free", "status": f"license expired {expires}",
+                "email": payload.get("email"), "expires": expires}
+    return {"plan": str(payload.get("plan") or "pro"), "status": "valid",
+            "email": payload.get("email"), "issued": payload.get("issued"),
+            "expires": expires}
+
+
+def cmd_license(args) -> None:
+    if args.action == "install":
+        if not args.license:
+            warn("usage: license install <file-or-string>")
+            return
+        text = args.license
+        candidate = Path(text)
+        try:
+            if candidate.is_file():
+                text = candidate.read_text()
+        except OSError:
+            pass
+        state = license_state(text)
+        if state["status"] != "valid":
+            warn(f"not installed: {state['status']}")
+            return
+        LICENSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LICENSE_PATH.write_text("".join(text.split()) + "\n")
+        say(f"{C_GREEN}✓ Pro license installed{C_RESET} for "
+            f"{state.get('email') or 'unknown'}"
+            + (f" (expires {state['expires']})" if state.get("expires")
+               else " (no expiry)"))
+    else:
+        state = license_state()
+        marker = C_GREEN + "✓" + C_RESET if state["status"] == "valid" \
+            else C_YELLOW + "–" + C_RESET
+        say(f"{C_BOLD}coding-ledger license{C_RESET}")
+        say(f"  {marker} plan: {state['plan']}   status: {state['status']}")
+        for key in ("email", "issued", "expires"):
+            if state.get(key):
+                say(f"    {key}: {state[key]}")
+
+
 # ---------------------------------------------------------------- aggregation
 
 def compute_daily(db: sqlite3.Connection) -> dict:
@@ -2739,6 +2908,7 @@ def cmd_dashboard(args) -> None:
     s["scan_state"] = (db.execute(
         "SELECT status FROM scans ORDER BY id DESC LIMIT 1").fetchone() or ["provisional"])[0]
     s["completed_scans"] = 1 if has_complete_baseline(db) else 0
+    s["license_plan"] = license_state()["plan"]
     daily = s.pop("_daily")
     html = render_dashboard(s, daily)
     out = Path(args.out) if args.out else DASHBOARD_PATH
@@ -3193,12 +3363,12 @@ def render_dashboard(s: dict, daily: dict) -> str:
         attributed["ai_coding"].append(round(
             evidence.get("ai_only", 0) + shared * allocation["ai_share"], 2))
     profile = s["profile"]
-    payload = json.dumps({
+    payload_data = {
         "days": days, "sources": sources, "stacked": stacked, "palette": palette,
         "attributed": attributed, "bySource": s["hours_by_source"],
         "dimensions": profile["dimensions"],
         "attributionTotals": s["attributed_hours"],
-    }, separators=(",", ":"))
+    }
     tier_icons = {"bronze": "I", "silver": "II", "gold": "III",
                   "platinum": "IV", "locked": "—"}
     badge_cards = "".join(
@@ -3280,6 +3450,72 @@ max(your evidence, shared AI, screen) + independent AI</small>
     else:
         screen_card = ""
         screen_method = ""
+    sp, roi = s["ai_spend"], s["roi"]
+    pro = s.get("license_plan") == "pro"
+    spend_card = ""
+    roi_panel = ""
+    roi_payload = None
+    if sp["available"]:
+        totals = roi["totals"]
+        per_commit = (f"${totals['usd_per_commit']:,.2f} per shipped commit"
+                      if totals["usd_per_commit"] is not None else "no commits yet")
+        spend_card = f"""<article class="metric"><div class="eyebrow">AI spend, API-equivalent</div>
+<div class="number">${totals['spend_usd']:,.0f}</div>
+<small>{per_commit} · list prices, not what you paid</small></article>"""
+        roi_multiple = (f"{sp['subscription_roi_multiple']}x" if
+                        sp["subscription_roi_multiple"] else "set price")
+        if pro:
+            tool_rows = "".join(
+                f"<tr><td>{html.escape(source)}</td><td>${e['spend_usd']:,.0f}</td>"
+                f"<td>{e['conversion_pct']}%</td>"
+                f"<td>${e['unconverted_spend_usd']:,.0f}</td></tr>"
+                for source, e in roi["by_source"].items())
+            model_rows = "".join(
+                f"<tr><td>{html.escape(model)}</td><td>${usd:,.0f}</td></tr>"
+                for model, usd in list(sp["by_model"].items())[:8])
+            project_rows = "".join(
+                f"<tr><td>{html.escape(project)}</td><td>${e['spend_usd']:,.0f}</td>"
+                f"<td>{e['commits']:,}</td>"
+                f"<td>{'$' + format(e['usd_per_commit'], ',.2f') if e['usd_per_commit'] is not None else '—'}</td></tr>"
+                for project, e in list(roi["by_project"].items())[:8])
+            months = list(roi["by_month"])[-12:]
+            roi_payload = {
+                "months": months,
+                "spend": [roi["by_month"][m]["spend_usd"] for m in months],
+                "commits": [roi["by_month"][m]["commits"] for m in months]}
+            roi_panel = f"""<article class="panel"><h2>AI ROI</h2>
+<div class="insights">
+<article class="insight"><div class="eyebrow">Unconverted spend</div>
+<strong>${totals['unconverted_spend_usd']:,.0f}</strong>
+<p>{totals['unconverted_pct']}% of spend had no commit in the project within {roi['window_days']} days.</p></article>
+<article class="insight"><div class="eyebrow">Cost per shipped commit</div>
+<strong>{'$' + format(totals['usd_per_commit'], ',.2f') if totals['usd_per_commit'] is not None else '—'}</strong>
+<p>All-time API-equivalent spend over {totals['commits']:,} local commits.</p></article>
+<article class="insight"><div class="eyebrow">Subscription ROI</div>
+<strong>{roi_multiple}</strong>
+<p>${sp['monthly_value_usd']:,.0f}/mo API-equivalent value{' ÷ $' + format(sp['subscription_usd_month'], ',.0f') + '/mo subscription' if sp['subscription_usd_month'] else ' — set your price with roi --set-subscription'}.</p></article>
+</div>
+<section class="two"><div><div class="chartbox"><canvas id="roiChart"></canvas></div>
+<p class="chart-note"><b>How to read this:</b> {html.escape(roi['label'])}. Sources without token
+data ({html.escape(', '.join(source for source, c in sp['coverage'].items() if not c['with_tokens']) or 'none')}) are coverage gaps, never inferred.</p></div>
+<div><table><thead><tr><th>Tool</th><th>Spend</th><th>Conversion</th><th>Unconverted</th></tr></thead>
+<tbody>{tool_rows}</tbody></table>
+<table style="margin-top:14px"><thead><tr><th>Model</th><th>Spend</th></tr></thead>
+<tbody>{model_rows}</tbody></table></div></section>
+<table style="margin-top:14px"><thead><tr><th>Project</th><th>Spend</th><th>Commits</th><th>$/commit</th></tr></thead>
+<tbody>{project_rows}</tbody></table></article>"""
+        else:
+            roi_panel = f"""<article class="panel"><h2>AI ROI</h2>
+<div class="insights">
+<article class="insight"><div class="eyebrow">AI spend, API-equivalent</div>
+<strong>${totals['spend_usd']:,.0f}</strong><p>{per_commit}. List prices, not what you paid.</p></article>
+<article class="insight"><div class="eyebrow">Pro deep-dive</div><strong>Locked</strong>
+<p>Per-tool conversion, per-model and per-project breakdowns, monthly trends,
+unconverted spend, and the ROI share card unlock with a Pro license:
+<code>coding-ledger license install &lt;file&gt;</code>.</p></article>
+</div></article>"""
+    payload_data["roi"] = roi_payload
+    payload = json.dumps(payload_data, separators=(",", ":"))
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -3351,8 +3587,10 @@ h1{{font-size:4rem}}.topline{{gap:10px;flex-wrap:wrap}}}}
 <article class="metric"><div class="eyebrow">AI sessions</div><div class="number">{s['sessions']:,}</div>
 <small>Claude · Codex · Gemini · Grok · Cursor · Aider</small></article>
 {screen_card}
+{spend_card}
 </section>
 <article class="panel"><h2>Workflow analytics</h2><div class="insights">{analytics_cards}</div></article>
+{roi_panel}
 <article class="panel"><h2>Building rhythm</h2><div class="rhythm-stats">
 <div class="rhythm-stat"><b>{rhythm['calendar_days']:,}</b><span>calendar days</span></div>
 <div class="rhythm-stat"><b>{rhythm['active_days']:,}</b><span>building days</span></div>
@@ -3387,6 +3625,11 @@ options:{{maintainAspectRatio:false,plugins:{{legend:{{display:false}}}},scales:
 new Chart(document.getElementById("source"),{{type:"doughnut",data:{{labels:Object.keys(D.bySource),
 datasets:[{{data:Object.values(D.bySource),backgroundColor:Object.keys(D.bySource).map(s=>D.palette[s]||"#8d99ae"),borderColor:"#f0eadb"}}]}},
 options:{{maintainAspectRatio:false,cutout:"62%"}}}});
+if(D.roi){{new Chart(document.getElementById("roiChart"),{{data:{{labels:D.roi.months,datasets:[
+{{type:"bar",label:"API-equivalent spend ($)",data:D.roi.spend,backgroundColor:"#16324f",yAxisID:"y"}},
+{{type:"line",label:"Commits",data:D.roi.commits,borderColor:"#e76f51",pointBackgroundColor:"#e76f51",yAxisID:"y1"}}]}},
+options:{{maintainAspectRatio:false,scales:{{y:{{position:"left",title:{{display:true,text:"$"}}}},
+y1:{{position:"right",grid:{{drawOnChartArea:false}},title:{{display:true,text:"commits"}}}}}}}}}});}}
 </script></body></html>"""
 
 
@@ -3532,6 +3775,11 @@ def main() -> None:
     p.add_argument("--out-dir", default=str(LEDGER_DIR / "share"),
                    help="export directory (default ~/.coding-ledger/share)")
     p.set_defaults(fn=cmd_export)
+
+    p = sub.add_parser("license", help="install or inspect the Pro license")
+    p.add_argument("action", choices=["install", "status"])
+    p.add_argument("license", nargs="?", help="license file or string (install)")
+    p.set_defaults(fn=cmd_license)
 
     p = sub.add_parser("doctor", help="show which sources are available")
     p.set_defaults(fn=cmd_doctor)

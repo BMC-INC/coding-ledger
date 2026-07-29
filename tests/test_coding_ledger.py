@@ -26,7 +26,8 @@ class LedgerTestCase(unittest.TestCase):
         self.db_path = self.root / "ledger.db"
         self.db = ledger.open_db(self.db_path)
         for attr, filename in (("SCREEN_APPS_CONFIG", "screen_apps.json"),
-                               ("PRICING_CONFIG", "pricing.json")):
+                               ("PRICING_CONFIG", "pricing.json"),
+                               ("LICENSE_PATH", "license.json")):
             patcher = mock.patch.object(ledger, attr, self.root / filename)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -909,6 +910,106 @@ class LedgerTestCase(unittest.TestCase):
         self.assertIn("Unconverted spend", report)
         self.assertIn("| claude |", report)
         self.assertIn("never inferred", report)
+
+    def test_ed25519_verify_matches_rfc8032_vector(self):
+        pubkey = bytes.fromhex(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+        sig = bytes.fromhex(
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8"
+            "821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+        self.assertTrue(ledger.ed25519_verify(sig, b"", pubkey))
+        self.assertFalse(ledger.ed25519_verify(sig, b"tampered", pubkey))
+        self.assertFalse(ledger.ed25519_verify(sig[:-1] + b"\x00", b"", pubkey))
+
+    def _issue_test_license(self, **kwargs):
+        import importlib.util as ilu
+        spec = ilu.spec_from_file_location(
+            "sign_license", MODULE_PATH.parent / "tools" / "sign_license.py")
+        signer = ilu.module_from_spec(spec)
+        spec.loader.exec_module(signer)
+        seed = b"\x07" * 32
+        pubkey_hex = signer.public_key(seed).hex()
+        text = signer.make_license(
+            seed, kwargs.get("email", "buyer@example.com"),
+            kwargs.get("plan", "pro"), kwargs.get("expires"),
+            issued="2026-01-01")
+        return text, pubkey_hex
+
+    def test_license_valid_tampered_and_expired(self):
+        text, pubkey_hex = self._issue_test_license()
+        state = ledger.license_state(text, pubkey_hex=pubkey_hex)
+        self.assertEqual(state["plan"], "pro")
+        self.assertEqual(state["status"], "valid")
+        self.assertEqual(state["email"], "buyer@example.com")
+        # tamper with the payload: signature must fail
+        payload_b64, sig_b64 = text.split(".")
+        forged = json.loads(ledger._b64url_decode(payload_b64))
+        forged["email"] = "attacker@example.com"
+        import base64 as b64
+        forged_b64 = b64.urlsafe_b64encode(
+            json.dumps(forged, separators=(",", ":"),
+                       sort_keys=True).encode()).decode().rstrip("=")
+        tampered = ledger.license_state(
+            f"{forged_b64}.{sig_b64}", pubkey_hex=pubkey_hex)
+        self.assertEqual(tampered["plan"], "free")
+        self.assertIn("signature", tampered["status"])
+        # expired license drops to free with a labeled status
+        expired_text, _ = self._issue_test_license(expires="2026-06-30")
+        expired = ledger.license_state(
+            expired_text, pubkey_hex=pubkey_hex, today="2026-07-28")
+        self.assertEqual(expired["plan"], "free")
+        self.assertIn("expired", expired["status"])
+        # wrong public key never validates
+        wrong = ledger.license_state(
+            text, pubkey_hex="00" * 32)
+        self.assertEqual(wrong["plan"], "free")
+
+    def test_license_install_and_status_commands(self):
+        text, pubkey_hex = self._issue_test_license()
+        license_file = self.root / "license.txt"
+        license_file.write_text(text + "\n")
+        with mock.patch.object(ledger, "LICENSE_PUBKEY_HEX", pubkey_hex):
+            args = argparse.Namespace(
+                db=self.db_path, action="install", license=str(license_file))
+            capture = io.StringIO()
+            with contextlib.redirect_stdout(capture):
+                ledger.cmd_license(args)
+            self.assertIn("Pro license installed", capture.getvalue())
+            self.assertTrue((self.root / "license.json").is_file())
+            args = argparse.Namespace(
+                db=self.db_path, action="status", license=None)
+            capture = io.StringIO()
+            with contextlib.redirect_stdout(capture):
+                ledger.cmd_license(args)
+            self.assertIn("plan: pro", capture.getvalue())
+        # garbage never installs
+        args = argparse.Namespace(
+            db=self.db_path, action="install", license="not.a.license")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            ledger.cmd_license(args)
+        self.assertIn("not installed", stderr.getvalue())
+
+    def test_dashboard_roi_gates_on_license(self):
+        self._seed_roi_events()
+        summary = ledger.summarize(self.db)
+        summary["scan_state"] = "complete"
+        summary["completed_scans"] = 1
+        daily = summary.pop("_daily")
+        summary["license_plan"] = "pro"
+        pro_html = ledger.render_dashboard(summary, daily)
+        self.assertIn("AI ROI", pro_html)
+        self.assertIn("roiChart", pro_html)
+        self.assertIn("Unconverted spend", pro_html)
+        self.assertIn("not causation", pro_html)
+        self.assertIn("gemini", pro_html)  # coverage gap named
+        summary["license_plan"] = "free"
+        free_html = ledger.render_dashboard(summary, daily)
+        self.assertIn("AI ROI", free_html)
+        self.assertIn("Locked", free_html)
+        self.assertNotIn('<canvas id="roiChart">', free_html)
+        self.assertIn('"roi":null', free_html)
+        self.assertIn("license install", free_html)
 
     def test_project_diversity_compares_multi_project_momentum(self):
         start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
