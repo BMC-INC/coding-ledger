@@ -1510,6 +1510,42 @@ def sum_token_buckets(token_models: dict[str, dict]) -> dict[str, int]:
     return total
 
 
+def scan_github_prs(db: sqlite3.Connection, login: str) -> tuple[int, list[str]]:
+    """Merged authored PRs as zero-hour outcome evidence (repo, number,
+    created/closed timestamps only — no titles or bodies)."""
+    if not login:
+        return 0, ["gh-prs: no login resolved"]
+    rc, out = _gh(["search", "prs", "--author", login, "--merged",
+                   "--limit", "1000", "--json",
+                   "number,repository,createdAt,closedAt"], timeout=120)
+    if rc != 0:
+        return 0, ["gh-prs: gh search failed (is gh authenticated?)"]
+    try:
+        rows = json.loads(out)
+    except ValueError:
+        return 0, ["gh-prs: unparseable gh output"]
+    added = 0
+    for row in rows:
+        repo_full = ((row.get("repository") or {}).get("nameWithOwner")
+                     or (row.get("repository") or {}).get("name") or "")
+        number = row.get("number")
+        created = parse_iso(row.get("createdAt") or "")
+        closed = parse_iso(row.get("closedAt") or "")
+        if not repo_full or not number or not created:
+            continue
+        hours_to_merge = round(
+            (closed - created).total_seconds() / 3600, 1) if closed else None
+        if insert_event(
+                db, f"ghpr:{repo_full}#{number}", "github", "pr",
+                created, closed, repo_full.rsplit("/", 1)[-1], items=1,
+                meta={"merged": True, "repo": repo_full,
+                      "hours_to_merge": hours_to_merge}):
+            added += 1
+    db.commit()
+    notes = ["gh-prs: hit the 1000-result search cap"] if len(rows) >= 1000 else []
+    return added, notes
+
+
 # ---------------------------------------------------------------- pro license
 # Offline, honor-based Pro license: a base64url(payload_json).base64url(sig)
 # string verified with Ed25519 against the embedded public key. Rendering-only
@@ -2335,6 +2371,18 @@ def summarize(db: sqlite3.Connection) -> dict:
         db, agg, total_hours, allocation["ai_coding"], profile)
     session_count = db.execute(
         "SELECT COUNT(*) FROM events WHERE kind='session'").fetchone()[0]
+    merge_lags = []
+    pr_count = 0
+    for (pr_meta,) in db.execute("SELECT meta FROM events WHERE kind='pr'"):
+        pr_count += 1
+        lag = (json.loads(pr_meta) if pr_meta else {}).get("hours_to_merge")
+        if isinstance(lag, (int, float)):
+            merge_lags.append(float(lag))
+    pull_requests = {
+        "merged": pr_count,
+        "median_hours_to_merge": round(statistics.median(merge_lags), 1)
+        if merge_lags else None,
+    }
     trajectory_receipts = sum(
         int((json.loads(row[0]) if row[0] else {}).get("trajectory_receipts", 0))
         for row in db.execute("SELECT meta FROM events WHERE kind='agent_receipts'"))
@@ -2371,6 +2419,7 @@ def summarize(db: sqlite3.Connection) -> dict:
         "involved_formula": involved_formula,
         "ai_spend": ai_spend,
         "roi": roi_outcomes(db, agg),
+        "pull_requests": pull_requests,
         "coauthor_allocation": {
             "shared_hours": round(evidence_hours["coauthored"], 1),
             "your_base_hours": round(evidence_hours["own"], 1),
@@ -2544,6 +2593,21 @@ def cmd_scan(args) -> None:
                        (total_added, "; ".join(all_notes)[-8000:], scan_id))
             db.commit()
             say(f"  {C_CYAN}{s}{C_RESET}: +{added} events ({time.time()-t:.1f}s)")
+        if args.gh_prs:
+            t = time.time()
+            login = args.gh_login or meta_get(db, "gh_login") or ""
+            if not login:
+                rc, out = _gh(["api", "user", "--jq", ".login"])
+                if rc == 0 and out.strip():
+                    login = out.strip()
+                    meta_set(db, "gh_login", login)
+            added, notes = scan_github_prs(db, login)
+            total_added += added
+            all_notes += notes
+            db.execute("UPDATE scans SET added=?,notes=? WHERE id=?",
+                       (total_added, "; ".join(all_notes)[-8000:], scan_id))
+            db.commit()
+            say(f"  {C_CYAN}gh-prs{C_RESET}: +{added} events ({time.time()-t:.1f}s)")
     except BaseException as exc:
         note = f"interrupted: {type(exc).__name__}"
         all_notes.append(note)
@@ -2625,8 +2689,14 @@ def cmd_status(args) -> None:
                 f"(${sp['monthly_value_usd']:,.0f}/mo value ÷ "
                 f"${sp['subscription_usd_month']:,.0f}/mo)")
         say("")
+    prs = s["pull_requests"]
+    pr_note = ""
+    if prs["merged"]:
+        pr_note = f"   merged PRs: {prs['merged']:,}"
+        if prs["median_hours_to_merge"] is not None:
+            pr_note += f" ({prs['median_hours_to_merge']:,}h median merge)"
     say(f"  local commits: {s['total_commits']:,}   net LOC: {s['net_loc']:,}   "
-        f"sessions: {s['sessions']:,}")
+        f"sessions: {s['sessions']:,}{pr_note}")
     analytics = s["analytics"]
     say(f"  AI leverage: {analytics['ai_leverage_pct']}%   "
         f"top-project focus: {analytics['top_project_focus_pct']}%   "
@@ -2781,6 +2851,11 @@ def cmd_report(args) -> None:
     if s["remote_commits"]:
         L.append(f"- Remote-only GitHub commits: **{s['remote_commits']:,}** "
                  f"(+{s['github_loc_added']:,} LOC)")
+    if s["pull_requests"]["merged"]:
+        median_merge = s["pull_requests"]["median_hours_to_merge"]
+        L.append(f"- Merged authored PRs: **{s['pull_requests']['merged']:,}**"
+                 + (f" — median {median_merge:,}h to merge"
+                    if median_merge is not None else ""))
     if s["ai_spend"]["available"]:
         L.append(f"- AI spend, API-equivalent: **${s['ai_spend']['total_usd']:,.0f}** "
                  f"(what the tokens would cost at list prices, not what you paid)")
@@ -3839,6 +3914,8 @@ def main() -> None:
                    help="re-walk roots for repos instead of using the cached list")
     p.add_argument("--reprocess-sessions", action="store_true",
                    help="reparse selected agent/editor sources even when files are unchanged")
+    p.add_argument("--gh-prs", action="store_true",
+                   help="also record merged authored PRs via gh (zero hours, outcomes only)")
     p.add_argument("--git-timeout", type=int, default=GIT_TIMEOUT_S,
                    help="per-repo git log timeout in seconds (bump for cold iCloud repos)")
     p.set_defaults(fn=cmd_scan)

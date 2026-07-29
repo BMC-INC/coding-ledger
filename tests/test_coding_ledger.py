@@ -399,7 +399,8 @@ class LedgerTestCase(unittest.TestCase):
         args = argparse.Namespace(
             db=self.db_path, author="James Benton", sources="git",
             roots=str(self.root / "Projects"), rediscover=False, git_timeout=1,
-            reprocess_sessions=False, gh_owners=None, gh_login=None)
+            reprocess_sessions=False, gh_owners=None, gh_login=None,
+            gh_prs=False)
         self.db.close()
         with mock.patch.object(ledger, "scan_git", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
@@ -1010,6 +1011,34 @@ class LedgerTestCase(unittest.TestCase):
         self.assertNotIn('<canvas id="roiChart">', free_html)
         self.assertIn('"roi":null', free_html)
         self.assertIn("license install", free_html)
+
+    def test_gh_prs_scan_records_zero_hour_outcomes(self):
+        payload = json.dumps([
+            {"number": 4, "repository": {"nameWithOwner": "BMC-INC/campguard"},
+             "createdAt": "2026-01-01T10:00:00Z",
+             "closedAt": "2026-01-01T16:00:00Z"},
+            {"number": 9, "repository": {"nameWithOwner": "BMC-INC/corpus"},
+             "createdAt": "2026-01-02T10:00:00Z",
+             "closedAt": "2026-01-02T12:00:00Z"},
+        ])
+        with mock.patch.object(ledger, "_gh", return_value=(0, payload)):
+            added, notes = ledger.scan_github_prs(self.db, "kingjames831")
+        self.assertEqual(added, 2)
+        self.assertEqual(notes, [])
+        row = self.db.execute(
+            "SELECT kind,project,meta FROM events WHERE uid="
+            "'ghpr:BMC-INC/campguard#4'").fetchone()
+        self.assertEqual(row[0], "pr")
+        self.assertEqual(row[1], "campguard")
+        self.assertEqual(json.loads(row[2])["hours_to_merge"], 6.0)
+        summary = ledger.summarize(self.db)
+        self.assertEqual(summary["pull_requests"]["merged"], 2)
+        self.assertEqual(summary["pull_requests"]["median_hours_to_merge"], 4.0)
+        # zero hours: PR events add no time to any total
+        self.assertEqual(summary["raw_total_hours"], 0)
+        with mock.patch.object(ledger, "_gh", return_value=(0, payload)):
+            added, _ = ledger.scan_github_prs(self.db, "kingjames831")
+        self.assertEqual(added, 0)  # idempotent
 
     def test_roi_share_card_is_public_safe(self):
         self._seed_roi_events()
