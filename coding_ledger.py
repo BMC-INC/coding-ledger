@@ -87,6 +87,7 @@ TARGET_HOURS = 10_000
 KNOWLEDGE_DB = HOME / "Library" / "Application Support" / "Knowledge" / "knowledgeC.db"
 APPLE_EPOCH_S = 978307200     # 2001-01-01 UTC, the Core Data epoch
 SCREEN_APPS_CONFIG = LEDGER_DIR / "screen_apps.json"
+PRICING_CONFIG = LEDGER_DIR / "pricing.json"
 SCREEN_DAY_CAP_H = 18.0       # sanity cap on foreground coding hours per day
 SCREEN_MIN_EVIDENCE_H = 0.25  # a day needs 15 min in coding apps to count active
 SCREEN_MIN_APP_DAY_S = 60     # ignore sub-minute per-app daily slivers
@@ -454,6 +455,36 @@ def scan_git(db: sqlite3.Connection, roots: list[Path], authors: list[str],
 # shared by claude + cursor agent transcripts
 
 TS_RE = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+MSG_ID_RE = re.compile(r'"id"\s*:\s*"(msg_[^"]+)"')
+
+
+def _collect_line_usage(line: str, seen_ids: set[str],
+                        token_models: dict[str, dict[str, int]]) -> None:
+    """Sum message.usage exactly once per API message id.
+
+    Claude Code writes one line per assistant content block, repeating the same
+    message id and identical usage up to several times; summing per line would
+    overcount several-fold."""
+    id_match = MSG_ID_RE.search(line[:4000])
+    if id_match and id_match.group(1) in seen_ids:
+        return
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return
+    message = row.get("message") if isinstance(row.get("message"), dict) else {}
+    usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+    model = str(message.get("model") or "")
+    msg_id = str(message.get("id") or "")
+    if not usage or not model or model.startswith("<") or msg_id in seen_ids:
+        return
+    if msg_id:
+        seen_ids.add(msg_id)
+    bucket = token_models.setdefault(model, {key: 0 for key in TOKEN_KEYS})
+    bucket["input"] += int(usage.get("input_tokens", 0) or 0)
+    bucket["output"] += int(usage.get("output_tokens", 0) or 0)
+    bucket["cache_read"] += int(usage.get("cache_read_input_tokens", 0) or 0)
+    bucket["cache_write"] += int(usage.get("cache_creation_input_tokens", 0) or 0)
 
 
 def scan_session_jsonl(db: sqlite3.Connection, path: Path, source: str,
@@ -464,6 +495,8 @@ def scan_session_jsonl(db: sqlite3.Connection, path: Path, source: str,
         return False
     activity: list[tuple[datetime, str]] = []
     msgs = tools = users = tests = parallel = 0
+    token_models: dict[str, dict[str, int]] = {}
+    seen_msg_ids: set[str] = set()
     try:
         with open(path, "r", errors="replace") as fh:
             for line in fh:
@@ -483,6 +516,8 @@ def scan_session_jsonl(db: sqlite3.Connection, path: Path, source: str,
                     activity.append((ts, kind))
                 if '"type":"assistant"' in prefix or '"type": "assistant"' in prefix:
                     msgs += 1
+                    if '"usage"' in line:
+                        _collect_line_usage(line, seen_msg_ids, token_models)
                 tools += prefix.count('"type":"tool_use"') + prefix.count('"function_call"')
                 lowered = prefix.lower()
                 if any(token in lowered for token in ("cargo test", "pytest", "npm test",
@@ -497,12 +532,15 @@ def scan_session_jsonl(db: sqlite3.Connection, path: Path, source: str,
         return False
     active_s, days, attribution = sessions_from_activity(activity)
     stamps = sorted(ts for ts, _ in activity)
+    meta = {"active_s": active_s, "days": days, **attribution, "tools": tools,
+            "user_messages": users, "test_calls": tests,
+            "parallel_calls": parallel, "file": str(path)}
+    if token_models:
+        meta["token_models"] = token_models
+        meta["tokens"] = sum_token_buckets(token_models)
     replace_event(db, uid, source=source, kind="session",
                   ts_start=stamps[0], ts_end=stamps[-1], project=project,
-                  items=msgs, meta={"active_s": active_s, "days": days,
-                                    **attribution, "tools": tools,
-                                    "user_messages": users, "test_calls": tests,
-                                    "parallel_calls": parallel, "file": str(path)})
+                  items=msgs, meta=meta)
     db.commit()  # per-file durability: interrupted scans lose nothing
     return True
 
@@ -556,6 +594,8 @@ def parse_codex_session(path: Path) -> dict | None:
     project = path.stem
     session_id = path.stem
     tools = users = assistants = tests = parallel = plan_turns = turns = 0
+    last_token_usage: dict | None = None
+    model_turns: dict[str, int] = {}
     try:
         with path.open("r", errors="replace") as fh:
             for line in fh:
@@ -573,10 +613,19 @@ def parse_codex_session(path: Path) -> dict | None:
                     session_id = str(payload.get("id") or session_id)
                 elif row_type == "turn_context":
                     turns += 1
+                    model = str(payload.get("model") or "")
+                    if model:
+                        model_turns[model] = model_turns.get(model, 0) + 1
                     mode = payload.get("collaboration_mode")
                     mode_text = json.dumps(mode, separators=(",", ":")).lower()
                     if "plan" in mode_text:
                         plan_turns += 1
+                elif row_type == "event_msg" and payload_type == "token_count":
+                    info = payload.get("info")
+                    if isinstance(info, dict) and isinstance(
+                            info.get("total_token_usage"), dict):
+                        # cumulative — the last event is the session total
+                        last_token_usage = info["total_token_usage"]
                 elif row_type == "event_msg" and payload_type == "user_message":
                     kind = "user"
                     users += 1
@@ -610,13 +659,21 @@ def parse_codex_session(path: Path) -> dict | None:
         return None
     active_s, days, attribution = sessions_from_activity(activity)
     stamps = [ts for ts, _ in activity]
-    return {
+    parsed = {
         "session_id": session_id, "project": project, "ts_start": min(stamps),
         "ts_end": max(stamps), "active_s": active_s, "days": days,
         **attribution, "items": assistants, "tools": tools,
         "user_messages": users, "test_calls": tests, "parallel_calls": parallel,
         "plan_turns": plan_turns, "turns": turns,
     }
+    if last_token_usage:
+        tokens = normalize_codex_tokens(last_token_usage)
+        # Cumulative totals cannot be split across models, so the whole
+        # session bucket is attributed to the dominant model by turn count.
+        dominant = max(model_turns, key=model_turns.get) if model_turns else "gpt-5"
+        parsed["tokens"] = tokens
+        parsed["token_models"] = {dominant: tokens}
+    return parsed
 
 
 def scan_codex(db: sqlite3.Connection) -> tuple[int, list[str]]:
@@ -1365,6 +1422,93 @@ def cmd_sync_github(args) -> None:
         raise SystemExit(1)
 
 
+# ---------------------------------------------------------------- pricing
+# API-equivalent list prices in USD per million tokens, keyed by fnmatch
+# pattern (first match wins). These label what the tokens would have cost at
+# list rates — not what was actually paid on a subscription. Override or
+# extend at ~/.coding-ledger/pricing.json:
+#   {"claude-fable-5*": {"input": 10, "output": 50,
+#                        "cache_read": 1, "cache_write": 12.5}}
+# Verified against published pricing pages on 2026-07-28.
+
+MODEL_PRICING = [  # (pattern, input, output, cache_read, cache_write)
+    ("claude-fable-5*", 10.0, 50.0, 1.0, 12.5),
+    ("claude-mythos-5*", 10.0, 50.0, 1.0, 12.5),
+    ("claude-opus-5*", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4-5*", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4-6*", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4-7*", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4-8*", 5.0, 25.0, 0.50, 6.25),
+    ("claude-opus-4*", 15.0, 75.0, 1.50, 18.75),   # 4.0/4.1 legacy pricing
+    ("claude-sonnet-5*", 2.0, 10.0, 0.20, 2.50),
+    ("claude-sonnet-4*", 3.0, 15.0, 0.30, 3.75),
+    ("claude-3-7-sonnet*", 3.0, 15.0, 0.30, 3.75),
+    ("claude-3-5-sonnet*", 3.0, 15.0, 0.30, 3.75),
+    ("claude-haiku-4-5*", 1.0, 5.0, 0.10, 1.25),
+    ("claude-3-5-haiku*", 0.80, 4.0, 0.08, 1.0),
+    ("gpt-5.6-sol*", 5.0, 30.0, 0.50, 6.25),
+    ("gpt-5.6-terra*", 2.5, 15.0, 0.25, 3.125),
+    ("gpt-5.6-luna*", 1.0, 6.0, 0.10, 1.25),
+    ("gpt-5.5*", 5.0, 30.0, 0.50, 6.25),
+    ("gpt-5.4*", 2.5, 15.0, 0.25, 3.125),
+    ("gpt-5*", 1.25, 10.0, 0.125, 1.5625),
+]
+
+TOKEN_KEYS = ("input", "output", "cache_read", "cache_write")
+
+
+def load_pricing() -> list[tuple[str, dict[str, float]]]:
+    """Pattern-ordered rate list; user pricing.json patterns win over built-ins."""
+    rates = [(pattern, {"input": i, "output": o, "cache_read": r, "cache_write": w})
+             for pattern, i, o, r, w in MODEL_PRICING]
+    try:
+        cfg = json.loads(PRICING_CONFIG.read_text())
+    except OSError:
+        return rates
+    except ValueError:
+        warn(f"pricing: invalid JSON in {PRICING_CONFIG}; using built-in table")
+        return rates
+    user: list[tuple[str, dict[str, float]]] = []
+    if isinstance(cfg, dict):
+        for pattern, entry in cfg.items():
+            if isinstance(entry, dict):
+                user.append((str(pattern), {
+                    key: float(entry.get(key, 0.0) or 0.0) for key in TOKEN_KEYS}))
+    return user + rates
+
+
+def price_tokens(model: str | None, tokens: dict,
+                 rates: list[tuple[str, dict[str, float]]]) -> float | None:
+    """API-equivalent USD for one normalized token bucket; None when unpriced."""
+    if not model:
+        return None
+    for pattern, rate in rates:
+        if fnmatch.fnmatchcase(model, pattern):
+            return sum(int(tokens.get(key, 0) or 0) * rate[key]
+                       for key in TOKEN_KEYS) / 1e6
+    return None
+
+
+def normalize_codex_tokens(total: dict) -> dict[str, int]:
+    """Codex counts cached tokens inside input_tokens; split them apart so the
+    normalized bucket prices identically to Claude's (which keeps them separate)."""
+    cached = int(total.get("cached_input_tokens", 0) or 0)
+    return {
+        "input": max(int(total.get("input_tokens", 0) or 0) - cached, 0),
+        "output": int(total.get("output_tokens", 0) or 0),
+        "cache_read": cached,
+        "cache_write": int(total.get("cache_write_input_tokens", 0) or 0),
+    }
+
+
+def sum_token_buckets(token_models: dict[str, dict]) -> dict[str, int]:
+    total = {key: 0 for key in TOKEN_KEYS}
+    for bucket in token_models.values():
+        for key in TOKEN_KEYS:
+            total[key] += int(bucket.get(key, 0) or 0)
+    return total
+
+
 # ---------------------------------------------------------------- aggregation
 
 def compute_daily(db: sqlite3.Connection) -> dict:
@@ -1381,6 +1525,15 @@ def compute_daily(db: sqlite3.Connection) -> dict:
     screen: dict[str, float] = {}             # day -> allowlisted foreground hours
     screen_apps: dict[str, float] = {}        # bundle id -> total hours
     screen_include, screen_exclude = load_screen_config()
+    rates = load_pricing()
+    spend_day: dict[str, float] = {}          # API-equivalent USD
+    spend_source: dict[str, float] = {}
+    spend_model: dict[str, float] = {}
+    spend_project: dict[str, float] = {}
+    tokens_source: dict[str, dict[str, int]] = {}
+    unpriced_models: dict[str, int] = {}
+    agent_sessions: dict[str, int] = {}
+    sessions_with_tokens: dict[str, int] = {}
 
     def bump_proj(p: str | None, h: float = 0, a: int = 0, d: int = 0):
         p = p or "misc"
@@ -1409,6 +1562,37 @@ def compute_daily(db: sqlite3.Connection) -> dict:
                 bucket["coauthored"] += coauthored_s * share / 3600
                 bucket["ai_only"] += ai_only_s * share / 3600
             bump_proj(project, h=active_s / 3600)
+            agent_sessions[source] = agent_sessions.get(source, 0) + 1
+            token_models = meta.get("token_models") or {}
+            if token_models:
+                sessions_with_tokens[source] = sessions_with_tokens.get(source, 0) + 1
+                src_tokens = tokens_source.setdefault(
+                    source, {key: 0 for key in TOKEN_KEYS})
+                event_usd = 0.0
+                for model, bucket_tokens in token_models.items():
+                    for key in TOKEN_KEYS:
+                        src_tokens[key] += int(bucket_tokens.get(key, 0) or 0)
+                    usd = price_tokens(model, bucket_tokens, rates)
+                    if usd is None:
+                        unpriced_models[model] = unpriced_models.get(model, 0) + \
+                            sum(int(bucket_tokens.get(key, 0) or 0)
+                                for key in TOKEN_KEYS)
+                        continue
+                    event_usd += usd
+                    spend_model[model] = spend_model.get(model, 0.0) + usd
+                if event_usd:
+                    spend_source[source] = spend_source.get(source, 0.0) + event_usd
+                    proj_name = project or "misc"
+                    spend_project[proj_name] = \
+                        spend_project.get(proj_name, 0.0) + event_usd
+                    session_days = meta.get("days") or {}
+                    day_total_s = sum(session_days.values())
+                    if day_total_s:
+                        for d, secs in session_days.items():
+                            spend_day[d] = spend_day.get(d, 0.0) + \
+                                event_usd * secs / day_total_s
+                    elif day:
+                        spend_day[day] = spend_day.get(day, 0.0) + event_usd
         elif kind == "commit" and day:
             evidence_days.add(day)
             commits_per_day[day] = commits_per_day.get(day, 0) + 1
@@ -1478,6 +1662,12 @@ def compute_daily(db: sqlite3.Connection) -> dict:
     return {"hours": hours, "loc": loc, "loc_add": loc_add,
             "commits": commits_per_day, "projects": proj, "attributed": attributed,
             "screen": screen, "screen_apps": screen_apps,
+            "spend": {"by_day": spend_day, "by_source": spend_source,
+                      "by_model": spend_model, "by_project": spend_project,
+                      "tokens_by_source": tokens_source,
+                      "unpriced_models": unpriced_models,
+                      "agent_sessions": agent_sessions,
+                      "sessions_with_tokens": sessions_with_tokens},
             "evidence_days": sorted(evidence_days)}
 
 
@@ -1791,6 +1981,46 @@ def summarize(db: sqlite3.Connection) -> dict:
     involved_formula = ("total_involved(day) = max(human_evidence, shared_ai, "
                         "screen_coding) + independent_ai")
 
+    spend = agg.get("spend", {})
+    spend_by_source = spend.get("by_source", {})
+    total_spend = sum(spend_by_source.values())
+    spend_by_month: dict[str, float] = {}
+    for spend_day_key, usd in spend.get("by_day", {}).items():
+        month = spend_day_key[:7]
+        spend_by_month[month] = spend_by_month.get(month, 0.0) + usd
+    subscription_usd = None
+    sub_raw = meta_get(db, "subscription_usd_month")
+    if sub_raw:
+        try:
+            subscription_usd = float(sub_raw)
+        except ValueError:
+            subscription_usd = None
+    monthly_values = [v for v in spend_by_month.values() if v > 0]
+    monthly_value = statistics.mean(monthly_values) if monthly_values else 0.0
+    coverage = {
+        source: {"sessions": count,
+                 "with_tokens": spend.get("sessions_with_tokens", {}).get(source, 0)}
+        for source, count in sorted(spend.get("agent_sessions", {}).items())}
+    ai_spend = {
+        "available": bool(spend_by_source),
+        "label": "API-equivalent value at list prices, not what you paid",
+        "total_usd": round(total_spend, 2),
+        "by_source": {k: round(v, 2) for k, v in sorted(
+            spend_by_source.items(), key=lambda kv: -kv[1])},
+        "by_model": {k: round(v, 2) for k, v in sorted(
+            spend.get("by_model", {}).items(), key=lambda kv: -kv[1])},
+        "by_month": {k: round(v, 2) for k, v in sorted(spend_by_month.items())},
+        "top_projects": {k: round(v, 2) for k, v in sorted(
+            spend.get("by_project", {}).items(), key=lambda kv: -kv[1])[:10]},
+        "tokens_by_source": spend.get("tokens_by_source", {}),
+        "coverage": coverage,
+        "unpriced_models": spend.get("unpriced_models", {}),
+        "monthly_value_usd": round(monthly_value, 2),
+        "subscription_usd_month": subscription_usd,
+        "subscription_roi_multiple": round(monthly_value / subscription_usd, 1)
+        if subscription_usd and monthly_value else None,
+    }
+
     rows = db.execute("SELECT source, COUNT(*), SUM(loc_add), SUM(loc_del), SUM(items) "
                       "FROM events GROUP BY source").fetchall()
     per_source = {r[0]: {"events": r[1], "loc_add": r[2] or 0,
@@ -1856,6 +2086,7 @@ def summarize(db: sqlite3.Connection) -> dict:
         "screen_time": screen_time,
         "total_involved_hours": total_involved_hours,
         "involved_formula": involved_formula,
+        "ai_spend": ai_spend,
         "coauthor_allocation": {
             "shared_hours": round(evidence_hours["coauthored"], 1),
             "your_base_hours": round(evidence_hours["own"], 1),
@@ -2098,6 +2329,18 @@ def cmd_status(args) -> None:
         say(f"  {'github':<8} {'(LOC only)':>10}   {gh['events']:>6} events  "
             f"+{gh['loc_add']:,}/-{gh['loc_del']:,} LOC, {gh['items']:,} commits")
     say("")
+    sp = s["ai_spend"]
+    if sp["available"]:
+        per_source_spend = " · ".join(
+            f"{source} ${usd:,.0f}" for source, usd in sp["by_source"].items())
+        say(f"  AI spend, API-equivalent: {C_BOLD}${sp['total_usd']:,.0f}{C_RESET} "
+            f"({per_source_spend})")
+        roi_multiple = sp["subscription_roi_multiple"]
+        if roi_multiple:
+            say(f"  subscription ROI: {roi_multiple}x "
+                f"(${sp['monthly_value_usd']:,.0f}/mo value ÷ "
+                f"${sp['subscription_usd_month']:,.0f}/mo)")
+        say("")
     say(f"  local commits: {s['total_commits']:,}   net LOC: {s['net_loc']:,}   "
         f"sessions: {s['sessions']:,}")
     analytics = s["analytics"]

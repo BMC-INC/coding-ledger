@@ -25,10 +25,11 @@ class LedgerTestCase(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.db_path = self.root / "ledger.db"
         self.db = ledger.open_db(self.db_path)
-        patcher = mock.patch.object(
-            ledger, "SCREEN_APPS_CONFIG", self.root / "screen_apps.json")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for attr, filename in (("SCREEN_APPS_CONFIG", "screen_apps.json"),
+                               ("PRICING_CONFIG", "pricing.json")):
+            patcher = mock.patch.object(ledger, attr, self.root / filename)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.db.close()
@@ -659,6 +660,147 @@ class LedgerTestCase(unittest.TestCase):
             "total_involved(day) = max(human_evidence, shared_ai, "
             "screen_coding) + independent_ai", report)
         self.assertIn("uncaptured", report)
+
+    def test_claude_usage_sums_once_per_message_id(self):
+        session = self.root / "claude.jsonl"
+        usage = {"input_tokens": 10, "output_tokens": 100,
+                 "cache_read_input_tokens": 1000,
+                 "cache_creation_input_tokens": 50}
+        rows = [
+            {"timestamp": "2026-01-01T12:00:00Z", "type": "user",
+             "message": {"role": "user", "content": "SECRET"}},
+            # same API message logged twice (one line per content block)
+            {"timestamp": "2026-01-01T12:00:10Z", "type": "assistant",
+             "message": {"id": "msg_a", "model": "claude-fable-5",
+                         "usage": usage}},
+            {"timestamp": "2026-01-01T12:00:11Z", "type": "assistant",
+             "message": {"id": "msg_a", "model": "claude-fable-5",
+                         "usage": usage}},
+            {"timestamp": "2026-01-01T12:00:30Z", "type": "assistant",
+             "message": {"id": "msg_b", "model": "claude-opus-5",
+                         "usage": {"input_tokens": 5, "output_tokens": 7}}},
+            {"timestamp": "2026-01-01T12:00:40Z", "type": "assistant",
+             "message": {"id": "msg_c", "model": "<synthetic>",
+                         "usage": {"input_tokens": 9, "output_tokens": 9}}},
+        ]
+        session.write_text("\n".join(json.dumps(row) for row in rows))
+        self.assertTrue(ledger.scan_session_jsonl(
+            self.db, session, "claude", "widget", uid="claude:test"))
+        meta = json.loads(self.db.execute(
+            "SELECT meta FROM events WHERE uid='claude:test'").fetchone()[0])
+        self.assertEqual(meta["token_models"]["claude-fable-5"], {
+            "input": 10, "output": 100, "cache_read": 1000, "cache_write": 50})
+        self.assertEqual(meta["token_models"]["claude-opus-5"], {
+            "input": 5, "output": 7, "cache_read": 0, "cache_write": 0})
+        self.assertNotIn("<synthetic>", meta["token_models"])
+        self.assertEqual(meta["tokens"]["input"], 15)
+        self.assertEqual(meta["tokens"]["output"], 107)
+
+    def test_codex_cumulative_token_count_uses_last_event(self):
+        session = self.root / "rollout.jsonl"
+        rows = [
+            {"timestamp": "2026-01-01T12:00:00Z", "type": "session_meta",
+             "payload": {"id": "s1", "cwd": "/tmp/widget"}},
+            {"timestamp": "2026-01-01T12:00:00Z", "type": "turn_context",
+             "payload": {"model": "gpt-5.6-sol"}},
+            {"timestamp": "2026-01-01T12:00:01Z", "type": "event_msg",
+             "payload": {"type": "user_message"}},
+            {"timestamp": "2026-01-01T12:00:10Z", "type": "event_msg",
+             "payload": {"type": "token_count", "info": {"total_token_usage": {
+                 "input_tokens": 1000, "cached_input_tokens": 600,
+                 "cache_write_input_tokens": 0, "output_tokens": 50,
+                 "reasoning_output_tokens": 10, "total_tokens": 1050}}}},
+            {"timestamp": "2026-01-01T12:01:00Z", "type": "event_msg",
+             "payload": {"type": "token_count", "info": {"total_token_usage": {
+                 "input_tokens": 5000, "cached_input_tokens": 4000,
+                 "cache_write_input_tokens": 0, "output_tokens": 300,
+                 "reasoning_output_tokens": 80, "total_tokens": 5300}}}},
+        ]
+        session.write_text("\n".join(json.dumps(row) for row in rows))
+        parsed = ledger.parse_codex_session(session)
+        # last cumulative event wins; cached tokens split out of input
+        self.assertEqual(parsed["tokens"], {
+            "input": 1000, "output": 300, "cache_read": 4000, "cache_write": 0})
+        self.assertEqual(list(parsed["token_models"]), ["gpt-5.6-sol"])
+
+    def test_pricing_math_and_user_override(self):
+        rates = ledger.load_pricing()
+        usd = ledger.price_tokens("claude-fable-5", {
+            "input": 1_000_000, "output": 100_000,
+            "cache_read": 2_000_000, "cache_write": 400_000}, rates)
+        # 1M*$10 + 0.1M*$50 + 2M*$1 + 0.4M*$12.50 = 10 + 5 + 2 + 5 = 22
+        self.assertAlmostEqual(usd, 22.0)
+        self.assertIsNone(ledger.price_tokens("mystery-model-9", {
+            "input": 1000}, rates))
+        (self.root / "pricing.json").write_text(json.dumps({
+            "claude-fable-5*": {"input": 1, "output": 1,
+                                "cache_read": 1, "cache_write": 1}}))
+        rates = ledger.load_pricing()
+        self.assertAlmostEqual(ledger.price_tokens(
+            "claude-fable-5", {"input": 1_000_000}, rates), 1.0)
+
+    def test_spend_is_allocated_across_days_and_summarized(self):
+        start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        ledger.insert_event(
+            self.db, "claude:spend", "claude", "session", start,
+            start + timedelta(days=1), "widget",
+            meta={"active_s": 7200,
+                  "days": {"2026-01-01": 5400, "2026-01-02": 1800},
+                  "coauthored_s": 7200, "ai_only_s": 0,
+                  "token_models": {"claude-opus-5": {
+                      "input": 1_000_000, "output": 200_000,
+                      "cache_read": 0, "cache_write": 0}}})
+        ledger.insert_event(
+            self.db, "codex:no-tokens", "codex", "session", start,
+            start + timedelta(hours=1), "widget",
+            meta={"active_s": 3600, "days": {"2026-01-01": 3600}})
+        self.db.commit()
+        summary = ledger.summarize(self.db)
+        spend = summary["ai_spend"]
+        # 1M*$5 + 0.2M*$25 = $10 total, split 75/25 across the two days
+        self.assertTrue(spend["available"])
+        self.assertEqual(spend["total_usd"], 10.0)
+        self.assertEqual(spend["by_source"], {"claude": 10.0})
+        self.assertEqual(spend["by_model"], {"claude-opus-5": 10.0})
+        self.assertEqual(spend["by_month"], {"2026-01": 10.0})
+        self.assertEqual(spend["top_projects"], {"widget": 10.0})
+        self.assertEqual(spend["coverage"]["claude"],
+                         {"sessions": 1, "with_tokens": 1})
+        self.assertEqual(spend["coverage"]["codex"],
+                         {"sessions": 1, "with_tokens": 0})
+        daily = summary["_daily"]
+        self.assertAlmostEqual(daily["spend"]["by_day"]["2026-01-01"], 7.5)
+        self.assertAlmostEqual(daily["spend"]["by_day"]["2026-01-02"], 2.5)
+        self.assertIn("not what you paid", spend["label"])
+
+    def test_unpriced_models_are_labeled_never_inferred(self):
+        start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        ledger.insert_event(
+            self.db, "claude:unpriced", "claude", "session", start,
+            start + timedelta(hours=1), "widget",
+            meta={"active_s": 3600, "days": {"2026-01-01": 3600},
+                  "token_models": {"mystery-model-9": {
+                      "input": 500, "output": 100,
+                      "cache_read": 0, "cache_write": 0}}})
+        self.db.commit()
+        spend = ledger.summarize(self.db)["ai_spend"]
+        self.assertEqual(spend["total_usd"], 0.0)
+        self.assertEqual(spend["unpriced_models"], {"mystery-model-9": 600})
+
+    def test_subscription_roi_multiple_from_meta(self):
+        start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        ledger.insert_event(
+            self.db, "claude:roi", "claude", "session", start,
+            start + timedelta(hours=1), "widget",
+            meta={"active_s": 3600, "days": {"2026-01-01": 3600},
+                  "token_models": {"claude-opus-5": {
+                      "input": 40_000_000, "output": 0,
+                      "cache_read": 0, "cache_write": 0}}})
+        ledger.meta_set(self.db, "subscription_usd_month", "100")
+        self.db.commit()
+        spend = ledger.summarize(self.db)["ai_spend"]
+        self.assertEqual(spend["monthly_value_usd"], 200.0)
+        self.assertEqual(spend["subscription_roi_multiple"], 2.0)
 
     def test_project_diversity_compares_multi_project_momentum(self):
         start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
