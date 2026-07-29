@@ -11,3 +11,6 @@ venv/
 *.egg-info/
 dist/
 build/
+CLAUDE.md
+IRONMEM.md
+license_signing_key
