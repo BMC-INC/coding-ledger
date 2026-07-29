@@ -1,11 +1,77 @@
 # Coding Ledger
 
-Coding Ledger is a local-first, evidence-backed record of coding work. It combines
-Git history, coding-agent sessions, editor receipts, and optional GitHub statistics
-without storing prompt bodies, source code, secrets, or tool output in its database.
+**Know what your AI actually returns.**
 
-It is a single Python 3.10+ standard-library application. The generated dashboard is
-self-contained and works offline.
+Coding Ledger reads the receipts already on your machine — Git history, Claude
+Code and Codex session logs, editor activity, macOS Screen Time — and turns
+them into an evidence-backed answer to three questions no other tool answers
+together:
+
+1. **How much did your AI work cost?** Token usage from local agent logs,
+   priced at API list rates ("API-equivalent value" — what it would have cost,
+   not what you paid on a subscription).
+2. **What did it return?** Spend tied to shipped commits and merged PRs:
+   cost per shipped commit, conversion rate per tool, unconverted spend,
+   monthly trends, and your subscription ROI multiple.
+3. **How do you actually work?** Human-versus-AI attribution, total involved
+   time verified against Screen Time, streaks, badges, and a shareable
+   builder field report.
+
+Everything runs locally. No prompts, source code, secrets, or tool output are
+ever stored. It is a single Python 3.10+ standard-library application with
+zero dependencies; the generated dashboard is self-contained and works
+offline.
+
+## Quick start
+
+```bash
+pipx install coding-ledger        # or: uvx coding-ledger, once published
+# from a clone, python3 coding_ledger.py works identically
+
+coding-ledger init --author "Your Name,you@example.com"
+coding-ledger scan --roots "$HOME/Projects"
+coding-ledger roi                 # AI spend tied to shipped outcomes
+coding-ledger today               # today and this week at a glance
+coding-ledger dashboard --open
+```
+
+## AI ROI
+
+The `roi` command and the dashboard's AI ROI section tie token spend to
+shipped outcomes:
+
+- Token usage is read from local Claude Code and Codex logs (Grok when its
+  logs carry usage). Sources without usage fields (Gemini, Cursor, Aider,
+  VS Code, Antigravity) are shown as coverage gaps, never inferred.
+- Dollar figures are **API-equivalent value at list prices**. The embedded
+  pricing table is overridable at `~/.coding-ledger/pricing.json`
+  (`{"model-pattern": {"input": .., "output": .., "cache_read": ..,
+  "cache_write": ..}}` in USD per million tokens). Unknown models are
+  labeled unpriced, never guessed.
+- `roi --set-subscription 200` stores your monthly subscription price and
+  unlocks the headline multiple: monthly API-equivalent value ÷ price.
+- `scan --gh-prs` also records merged authored PRs via `gh` (repo, number,
+  timestamps only) as zero-hour outcome evidence.
+- Backfill after upgrading:
+  `scan --sources claude,codex --reprocess-sessions`.
+
+## Free versus Pro
+
+Free and open: all scanning, the SQLite ledger, status, `roi`, `today`, full
+JSON/markdown reports, headline dashboard ROI totals, and the existing public
+scorecard exports.
+
+Pro (offline license, no phone-home): the dashboard ROI deep-dive (per-tool
+conversion, per-model and per-project breakdowns, monthly trend chart,
+unconverted-spend view) and the 1200×1350 AI ROI share card export.
+
+```bash
+coding-ledger license install <file-or-string>
+coding-ledger license status
+```
+
+The license is an Ed25519-signed blob verified against a key embedded in the
+script. Gating is honor-based and rendering-only.
 
 ## Sources
 
@@ -25,20 +91,6 @@ self-contained and works offline.
 
 Git commits are deduplicated by SHA. Growing agent sessions are replaced by stable,
 path-based event IDs, making rescans idempotent.
-
-## Quick start
-
-```bash
-python3 coding_ledger.py init \
-  --author "James Benton,kjscusoms831@gmail.com,jamesbenton@ymail.com"
-
-python3 coding_ledger.py scan \
-  --roots "$HOME/Projects,$HOME/dev,$HOME/Documents/Codex,/Volumes/MacBook Extended Storage/Coding-Ledger-GitHub"
-
-python3 coding_ledger.py status
-python3 coding_ledger.py report --format markdown
-python3 coding_ledger.py dashboard --open
-```
 
 Do not include iCloud-backed Desktop repositories in scan roots. Explicit roots are
 enforced even when the database contains older cached Desktop paths.
@@ -242,20 +294,24 @@ rules; it invalidates only the selected source caches and upserts the same stabl
 ## Open-core direction
 
 The scanner, SQLite ledger, reports, analytics, and generated local site are open and
-unlocked. The first product use case is an individual builder portfolio that proves
-how someone builds without exposing what they build. Potential hosted verification
-or team features are intentionally deferred until real usage establishes which
-workflows users value.
+unlocked; the Pro license gates only the dashboard ROI deep-dive and the ROI share
+card (see Free versus Pro above). The product thesis is the individual builder's
+work record in the AI era: prove how you build, and what your AI returns, without
+exposing what you build. Hosted verification and team features are intentionally
+deferred until real usage establishes which workflows users value.
 
 ## Commands
 
 ```text
 init              Initialize metadata and author identities
-scan              Scan selected sources and explicit roots
-status            Show terminal totals, attribution, and scan state
+scan              Scan selected sources and explicit roots (--gh-prs for PRs)
+status            Show terminal totals, attribution, spend, and scan state
+roi               AI spend tied to shipped outcomes (--set-subscription USD)
+today             Today and this week at a glance
 report            Produce Markdown or JSON
 dashboard         Generate the offline landing page and HTML field report
-export            Generate public-safe HTML, PDF, and LinkedIn image
+export            Generate public-safe HTML, PDF, LinkedIn image, ROI card
+license           Install or inspect the Pro license
 doctor            Show discoverable sources, including Codex
 sync-github       Maintain lightweight no-checkout GitHub history
 install-daemon    Install the macOS daily scan

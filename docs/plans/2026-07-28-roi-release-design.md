@@ -1,7 +1,8 @@
 # ROI Release Design
 
 Date: 2026-07-28
-Status: Approved, not yet implemented
+Status: Implemented and shipped as v1.0.0 on 2026-07-28 (all seven
+workstreams, including the post-approval screen-time addition)
 
 ## Decision
 
