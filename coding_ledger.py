@@ -3753,7 +3753,9 @@ def render_roi_card(s: dict, builder_name: str) -> str:
 <title>AI ROI — {html.escape(builder_name)}</title>
 <style>
 :root{{--paper:#f0eadb;--ink:#17211d;--muted:#6d7167;--acid:#d8ff4f;--navy:#16324f;--red:#e76f51}}
-*{{box-sizing:border-box;margin:0}}body{{width:1200px;height:1350px;overflow:hidden;background:var(--paper);
+*{{box-sizing:border-box;margin:0}}body{{margin:0;background:#d5d0c2}}
+.stage{{width:1200px;height:1350px;margin:0 auto;overflow:hidden}}
+.card{{width:1200px;height:1350px;overflow:hidden;transform-origin:top left;background:var(--paper);
 color:var(--ink);font:16px/1.5 "SFMono-Regular","Cascadia Mono",monospace;padding:56px;display:flex;flex-direction:column;
 background-image:linear-gradient(rgba(23,33,29,.045) 1px,transparent 1px);background-size:100% 28px}}
 h1{{font:800 92px/.85 "Iowan Old Style","Palatino Linotype",serif;letter-spacing:-.05em;margin:18px 0 6px}}
@@ -3778,6 +3780,7 @@ h1{{font:800 92px/.85 "Iowan Old Style","Palatino Linotype",serif;letter-spacing
 .toolrow b{{font-size:20px}}.toolrow em{{color:var(--muted);font-style:normal;font-size:12px}}
 footer{{display:flex;justify-content:space-between;border-top:2px solid var(--ink);padding-top:12px;margin-top:22px;color:var(--muted);font-size:13px}}
 </style></head><body>
+<div class="stage"><div class="card">
 <div class="topline"><span class="eyebrow">Coding Ledger / AI ROI Report</span>
 <span class="eyebrow">{html.escape(s['generated_at'][:10])}</span></div>
 <h1>WHAT MY AI<br>ACTUALLY RETURNS.</h1>
@@ -3799,6 +3802,13 @@ footer{{display:flex;justify-content:space-between;border-top:2px solid var(--in
 </div>
 <footer><span>CODING-LEDGER · LOCAL-FIRST · NO PROMPTS OR CODE STORED</span>
 <span>API-EQUIVALENT LIST PRICES</span></footer>
+</div></div>
+<script>
+(function(){{var stage=document.querySelector(".stage"),card=document.querySelector(".card");
+function fit(){{var s=Math.min(1,window.innerWidth/1200);card.style.transform="scale("+s+")";
+stage.style.width=(1200*s)+"px";stage.style.height=(1350*s)+"px";}}
+window.addEventListener("resize",fit);fit();}})();
+</script>
 </body></html>"""
 
 
