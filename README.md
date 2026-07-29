@@ -68,6 +68,13 @@ Pro (offline license, no phone-home): the dashboard ROI deep-dive (per-tool
 conversion, per-model and per-project breakdowns, monthly trend chart,
 unconverted-spend view) and the 1200×1350 AI ROI share card export.
 
+Buy Pro:
+
+- [$49 per year](https://buy.stripe.com/4gMeVd3PA3Oc3Ut0eQ6c000)
+- [$99 early lifetime](https://buy.stripe.com/7sY7sLeue70o9eNe5G6c001)
+
+Your license key is emailed after purchase. Then:
+
 ```bash
 coding-ledger license install <file-or-string>
 coding-ledger license status
