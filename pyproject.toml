@@ -8,7 +8,8 @@ version = "1.0.0"
 description = "Local-first record of your coding work: hours, attribution, and AI ROI from receipts. Zero dependencies."
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "james benton" }]
+license = { text = "Elastic-2.0" }
+authors = [{ name = "james benton" }, { name = "ExecLayer Inc." }]
 keywords = ["ai", "roi", "analytics", "claude", "codex", "coding", "local-first"]
 classifiers = [
     "Environment :: Console",

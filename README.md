@@ -2,6 +2,9 @@
 
 **Know what your AI actually returns.**
 
+By ExecLayer Inc. Source-available under the [Elastic License 2.0](LICENSE):
+free to use and modify, not OSI open source.
+
 Coding Ledger reads the receipts already on your machine — Git history, Claude
 Code and Codex session logs, editor activity, macOS Screen Time — and turns
 them into an evidence-backed answer to three questions no other tool answers
@@ -57,7 +60,7 @@ shipped outcomes:
 
 ## Free versus Pro
 
-Free and open: all scanning, the SQLite ledger, status, `roi`, `today`, full
+Free: all scanning, the SQLite ledger, status, `roi`, `today`, full
 JSON/markdown reports, headline dashboard ROI totals, and the existing public
 scorecard exports.
 
@@ -291,10 +294,15 @@ interruption. Git timeouts are recorded with exact repository paths.
 Use `scan --sources claude,codex,gemini,grok --reprocess-sessions` after changing attribution
 rules; it invalidates only the selected source caches and upserts the same stable events.
 
-## Open-core direction
+## License and direction
 
-The scanner, SQLite ledger, reports, analytics, and generated local site are open and
-unlocked; the Pro license gates only the dashboard ROI deep-dive and the ROI share
+Coding Ledger is source-available, not open source. The code is licensed under
+the [Elastic License 2.0](LICENSE), copyright ExecLayer Inc.: use it, read it,
+and modify it freely; you may not offer it as a hosted service, circumvent or
+remove the Pro license gating, or strip the licensing notices.
+
+The scanner, SQLite ledger, reports, analytics, and generated local site are free
+and unlocked; the Pro license gates only the dashboard ROI deep-dive and the ROI share
 card (see Free versus Pro above). The product thesis is the individual builder's
 work record in the AI era: prove how you build, and what your AI returns, without
 exposing what you build. Hosted verification and team features are intentionally
