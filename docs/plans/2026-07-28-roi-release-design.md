@@ -95,11 +95,59 @@ Pro (offline license):
 - Homebrew tap formula in BMC-INC as the final packaging step.
 - README repositioned around ROI with the new quickstart.
 
-## Workstream 6: tests and verification
+## Workstream 6: screen time (total involved time)
+
+Added 2026-07-28 after plan approval, at James's request: capture coding-app
+screen time so the ledger reflects total time involved, not only receipts.
+
+- Source: macOS Screen Time store at
+  `~/Library/Application Support/Knowledge/knowledgeC.db`, stream
+  `/app/usage` (per-app foreground intervals: bundle id, start, end).
+  Verified live and current on this machine on 2026-07-28. Read read-only via
+  stdlib sqlite3. Apple retains roughly four weeks, so each scan persists the
+  intervals into the ledger as durable events before Apple prunes them.
+- Event model: one stable event per day per bundle id
+  (`screen:<day>:<bundle_id>`), storing day, bundle id, merged foreground
+  seconds, and interval count. Rescans upsert the same ids (idempotent; the
+  current day updates in place). No window titles, no URLs, no document
+  names, consistent with the privacy boundary.
+- Allowlist: embedded default of coding apps (Terminal, iTerm, Warp,
+  VS Code, Cursor, Xcode, JetBrains IDEs, Android Studio, Claude Desktop)
+  with a user override at `~/.coding-ledger/screen_apps.json`. Browsers are
+  excluded by default because browsing intent is ambiguous.
+- Explicit formula. Screen time is an envelope over foreground work, never
+  an additive source, because it overlaps git, editor, and steering
+  evidence. Per day:
+
+  ```text
+  screen_hours   = allowlisted foreground seconds / 3600 (18h/day sanity cap)
+  uncaptured     = max(0, screen_hours - max(human_evidence, shared_ai))
+  total_involved = max(human_evidence, shared_ai, screen_hours)
+                   + independent_ai
+                 = attributed_total + uncaptured
+  ```
+
+  `uncaptured` is reading, reviewing, and debugging time in coding apps that
+  produced no receipt. It is reported as its own labeled line
+  ("screen-verified uncaptured time") and credits to Your Coding, never to
+  AI Coding. The existing raw sum and attributed total remain unchanged;
+  `total_involved` is a third explicit total. The formula is printed
+  verbatim in the README, the report, and the dashboard so nobody has to
+  guess how the number is built.
+- Surfaces: `status`, `report` (JSON and markdown), dashboard (new line plus
+  per-app breakdown), `today`. Free tier, since it is core measurement.
+- Failure mode: if the store is unreadable (Full Disk Access not granted to
+  the scanning context, common under launchd), the scan records a source
+  warning and continues; totals fall back to attributed-only and the gap is
+  labeled, never inferred.
+
+## Workstream 7: tests and verification
 
 - Fixture tests: Claude usage summation, Codex cumulative-total handling,
   pricing math, day allocation of spend, `roi` report block, license verify
-  (valid, tampered, expired), `today` output.
+  (valid, tampered, expired), `today` output, screen-time interval merge and
+  allowlist filtering, total-involved formula (envelope, cap, and
+  unavailable-store fallback).
 - Idempotent-rescan test extended to cover token backfill.
 - Existing CI (unittest via GitHub Actions) runs the suite.
 - Release requires: full test suite green, dashboard generation clean, browser
@@ -108,12 +156,13 @@ Pro (offline license):
 
 ## Sequencing (work-units, in order)
 
-1. Token ingestion (Claude, Codex) plus pricing table plus backfill.
-2. ROI computation, `roi` and `today` commands, report block.
-3. Dashboard ROI section, license verify, `license` subcommands, sign tool.
-4. ROI share card export (Pro).
-5. `--gh-prs` outcome scan.
-6. Packaging, README repositioning, brew tap, tagged release.
+1. Screen time source plus total-involved formula and surfaces.
+2. Token ingestion (Claude, Codex) plus pricing table plus backfill.
+3. ROI computation, `roi` and `today` commands, report block.
+4. Dashboard ROI section, license verify, `license` subcommands, sign tool.
+5. ROI share card export (Pro).
+6. `--gh-prs` outcome scan.
+7. Packaging, README repositioning, brew tap, tagged release.
 
 ## Out of scope this release
 
