@@ -28,7 +28,8 @@ offline.
 ## Quick start
 
 ```bash
-pipx install coding-ledger        # or: uvx coding-ledger, once published
+pipx install coding-ledger        # or: uvx coding-ledger
+# or: brew tap BMC-INC/coding-ledger && brew install coding-ledger
 # from a clone, python3 coding_ledger.py works identically
 
 coding-ledger init --author "Your Name,you@example.com"
