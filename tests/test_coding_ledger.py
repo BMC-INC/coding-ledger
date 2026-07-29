@@ -802,6 +802,114 @@ class LedgerTestCase(unittest.TestCase):
         self.assertEqual(spend["monthly_value_usd"], 200.0)
         self.assertEqual(spend["subscription_roi_multiple"], 2.0)
 
+    def _seed_roi_events(self):
+        start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+        # converted: a commit lands in the same project two hours after the session
+        ledger.insert_event(
+            self.db, "claude:converted", "claude", "session", start,
+            start + timedelta(hours=1), "widget",
+            meta={"active_s": 3600, "days": {"2026-01-01": 3600},
+                  "coauthored_s": 3600, "ai_only_s": 0,
+                  "token_models": {"claude-opus-5": {
+                      "input": 1_000_000, "output": 0,
+                      "cache_read": 0, "cache_write": 0}}})
+        ledger.insert_event(
+            self.db, "git:roi", "git", "commit", start + timedelta(hours=3),
+            None, "widget", items=1)
+        # unconverted: spend in a project that never ships a commit
+        ledger.insert_event(
+            self.db, "codex:unconverted", "codex", "session", start,
+            start + timedelta(hours=1), "orphan",
+            meta={"active_s": 3600, "days": {"2026-01-01": 3600},
+                  "coauthored_s": 3600, "ai_only_s": 0,
+                  "token_models": {"gpt-5.6-sol": {
+                      "input": 2_000_000, "output": 0,
+                      "cache_read": 0, "cache_write": 0}}})
+        # a source with no usage fields at all — must surface as a coverage gap
+        ledger.insert_event(
+            self.db, "gemini:no-usage", "gemini", "session", start,
+            start + timedelta(minutes=30), "widget",
+            meta={"active_s": 1800, "days": {"2026-01-01": 1800}})
+        self.db.commit()
+
+    def test_roi_ties_spend_to_shipped_commits(self):
+        self._seed_roi_events()
+        roi = ledger.summarize(self.db)["roi"]
+        self.assertTrue(roi["available"])
+        # claude 1M*$5 = $5 converted; codex 2M*$5 = $10 unconverted
+        self.assertEqual(roi["by_source"]["claude"]["conversion_pct"], 100.0)
+        self.assertEqual(roi["by_source"]["claude"]["converted_spend_usd"], 5.0)
+        self.assertEqual(roi["by_source"]["codex"]["conversion_pct"], 0.0)
+        self.assertEqual(roi["by_source"]["codex"]["unconverted_spend_usd"], 10.0)
+        totals = roi["totals"]
+        self.assertEqual(totals["spend_usd"], 15.0)
+        self.assertEqual(totals["commits"], 1)
+        self.assertEqual(totals["usd_per_commit"], 15.0)
+        self.assertEqual(totals["unconverted_spend_usd"], 10.0)
+        self.assertAlmostEqual(totals["unconverted_pct"], 66.7)
+        self.assertEqual(roi["by_month"]["2026-01"]["spend_usd"], 15.0)
+        self.assertEqual(roi["by_month"]["2026-01"]["commits"], 1)
+        self.assertEqual(roi["by_project"]["orphan"]["usd_per_commit"], None)
+        self.assertIn("not causation", roi["label"])
+
+    def test_roi_command_renders_tables_and_saves_subscription(self):
+        self._seed_roi_events()
+        self.db.commit()
+        args = argparse.Namespace(db=self.db_path, set_subscription=200.0)
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            ledger.cmd_roi(args)
+        out = capture.getvalue()
+        self.assertIn("subscription price saved", out)
+        self.assertIn("by tool", out)
+        self.assertIn("by month", out)
+        self.assertIn("claude", out)
+        self.assertIn("not what you paid", out)
+        con = sqlite3.connect(self.db_path)
+        saved = con.execute(
+            "SELECT value FROM meta WHERE key='subscription_usd_month'").fetchone()
+        con.close()
+        self.assertEqual(saved[0], "200.0")
+
+    def test_today_command_reports_daily_pulse(self):
+        now = datetime.now().astimezone()
+        today = now.strftime("%Y-%m-%d")
+        ledger.insert_event(
+            self.db, "claude:today", "claude", "session",
+            now - timedelta(hours=1), now, "widget",
+            meta={"active_s": 3600, "days": {today: 3600},
+                  "coauthored_s": 3600, "ai_only_s": 0,
+                  "token_models": {"claude-opus-5": {
+                      "input": 1_000_000, "output": 0,
+                      "cache_read": 0, "cache_write": 0}}})
+        ledger.insert_event(
+            self.db, "git:today", "git", "commit", now, None, "widget", items=1)
+        self.db.commit()
+        args = argparse.Namespace(db=self.db_path)
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            ledger.cmd_today(args)
+        out = capture.getvalue()
+        self.assertIn(today, out)
+        self.assertIn("AI spend $5", out)
+        self.assertIn("commits 1", out)
+        self.assertIn("streak", out)
+        self.assertIn("active 1/7", out)
+
+    def test_report_includes_roi_block(self):
+        self._seed_roi_events()
+        out = self.root / "report.md"
+        args = argparse.Namespace(db=self.db_path, format="markdown", out=str(out))
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            ledger.cmd_report(args)
+        report = out.read_text()
+        self.assertIn("## AI ROI", report)
+        self.assertIn("per shipped commit", report)
+        self.assertIn("Unconverted spend", report)
+        self.assertIn("| claude |", report)
+        self.assertIn("never inferred", report)
+
     def test_project_diversity_compares_multi_project_momentum(self):
         start = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
         for offset, project in ((0, "alpha"), (24, "alpha"), (25, "beta")):

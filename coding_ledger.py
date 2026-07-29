@@ -1938,6 +1938,120 @@ def workflow_analytics(db: sqlite3.Connection, agg: dict, total_hours: float,
     }
 
 
+ROI_WINDOW_DAYS = 7
+
+
+def roi_outcomes(db: sqlite3.Connection, agg: dict) -> dict:
+    """Tie API-equivalent spend to shipped commits. Correlation, not causation."""
+    spend = agg.get("spend", {})
+    if not spend.get("by_source"):
+        return {"available": False}
+    rates = load_pricing()
+    commits_by_project: dict[str, list[datetime]] = {}
+    commit_project_counts: dict[str, int] = {}
+    for project, ts_start in db.execute(
+            "SELECT project,ts_start FROM events WHERE kind='commit'"):
+        ts = parse_iso(ts_start)
+        name = project or "misc"
+        if ts:
+            commits_by_project.setdefault(name, []).append(ts)
+            commit_project_counts[name] = commit_project_counts.get(name, 0) + 1
+    for stamps in commits_by_project.values():
+        stamps.sort()
+
+    by_source: dict[str, dict] = {}
+    total_converted = total_unconverted = 0.0
+    for source, ts_start, ts_end, project, meta_s in db.execute(
+            "SELECT source,ts_start,ts_end,project,meta FROM events "
+            "WHERE kind='session'"):
+        meta = json.loads(meta_s) if meta_s else {}
+        token_models = meta.get("token_models") or {}
+        if not token_models:
+            continue
+        usd = sum(filter(None, (price_tokens(model, bucket, rates)
+                                for model, bucket in token_models.items())))
+        if not usd:
+            continue
+        entry = by_source.setdefault(source, {
+            "spend_usd": 0.0, "sessions_with_spend": 0,
+            "converted_sessions": 0, "converted_spend_usd": 0.0,
+            "unconverted_spend_usd": 0.0})
+        entry["spend_usd"] += usd
+        entry["sessions_with_spend"] += 1
+        end = parse_iso(ts_end or ts_start)
+        stamps = commits_by_project.get(project or "misc", [])
+        converted = False
+        if end and stamps:
+            index = bisect.bisect_left(stamps, end)
+            if index < len(stamps):
+                lag_h = (stamps[index] - end).total_seconds() / 3600
+                converted = 0 <= lag_h <= ROI_WINDOW_DAYS * 24
+        if converted:
+            entry["converted_sessions"] += 1
+            entry["converted_spend_usd"] += usd
+            total_converted += usd
+        else:
+            entry["unconverted_spend_usd"] += usd
+            total_unconverted += usd
+    for entry in by_source.values():
+        entry["conversion_pct"] = round(
+            100 * entry["converted_sessions"] / entry["sessions_with_spend"], 1) \
+            if entry["sessions_with_spend"] else 0.0
+        for key in ("spend_usd", "converted_spend_usd", "unconverted_spend_usd"):
+            entry[key] = round(entry[key], 2)
+
+    commits_by_month: dict[str, int] = {}
+    for commit_day, count in agg["commits"].items():
+        month = commit_day[:7]
+        commits_by_month[month] = commits_by_month.get(month, 0) + count
+    spend_by_month: dict[str, float] = {}
+    for spend_day_key, usd in spend.get("by_day", {}).items():
+        month = spend_day_key[:7]
+        spend_by_month[month] = spend_by_month.get(month, 0.0) + usd
+    by_month = {
+        month: {
+            "spend_usd": round(spend_by_month.get(month, 0.0), 2),
+            "commits": commits_by_month.get(month, 0),
+            "usd_per_commit": round(
+                spend_by_month[month] / commits_by_month[month], 2)
+            if spend_by_month.get(month) and commits_by_month.get(month) else None,
+        }
+        for month in sorted(set(spend_by_month) | set(commits_by_month))
+        if spend_by_month.get(month) or commits_by_month.get(month)}
+
+    by_project = {}
+    for project, usd in sorted(spend.get("by_project", {}).items(),
+                               key=lambda kv: -kv[1])[:12]:
+        commits = commit_project_counts.get(project, 0)
+        by_project[project] = {
+            "spend_usd": round(usd, 2), "commits": commits,
+            "usd_per_commit": round(usd / commits, 2) if commits else None}
+
+    total_spend = sum(spend["by_source"].values())
+    total_commits = sum(agg["commits"].values())
+    return {
+        "available": True,
+        "label": ("API-equivalent value at list prices tied to shipped "
+                  "commits; correlation, not causation"),
+        "window_days": ROI_WINDOW_DAYS,
+        "by_source": {source: by_source[source] for source in sorted(
+            by_source, key=lambda s: -by_source[s]["spend_usd"])},
+        "by_month": by_month,
+        "by_project": by_project,
+        "totals": {
+            "spend_usd": round(total_spend, 2),
+            "commits": total_commits,
+            "usd_per_commit": round(total_spend / total_commits, 2)
+            if total_commits else None,
+            "converted_spend_usd": round(total_converted, 2),
+            "unconverted_spend_usd": round(total_unconverted, 2),
+            "unconverted_pct": round(
+                100 * total_unconverted / (total_converted + total_unconverted), 1)
+            if (total_converted + total_unconverted) else 0.0,
+        },
+    }
+
+
 def summarize(db: sqlite3.Connection) -> dict:
     agg = compute_daily(db)
     hours = agg["hours"]
@@ -2087,6 +2201,7 @@ def summarize(db: sqlite3.Connection) -> dict:
         "total_involved_hours": total_involved_hours,
         "involved_formula": involved_formula,
         "ai_spend": ai_spend,
+        "roi": roi_outcomes(db, agg),
         "coauthor_allocation": {
             "shared_hours": round(evidence_hours["coauthored"], 1),
             "your_base_hours": round(evidence_hours["own"], 1),
@@ -2361,6 +2476,109 @@ def cmd_status(args) -> None:
             say(f"  {C_DIM}notes: {last[3][:300]}{C_RESET}")
 
 
+def cmd_roi(args) -> None:
+    db = open_db(args.db)
+    if args.set_subscription is not None:
+        meta_set(db, "subscription_usd_month", str(args.set_subscription))
+        db.commit()
+        say(f"{C_GREEN}✓ subscription price saved{C_RESET}: "
+            f"${args.set_subscription:,.2f}/month")
+    s = summarize(db)
+    sp, roi = s["ai_spend"], s["roi"]
+    say(f"{C_BOLD}coding-ledger roi{C_RESET}  "
+        f"{C_DIM}API-equivalent value at list prices, not what you paid{C_RESET}")
+    if not sp["available"]:
+        say("  no token data yet — run: scan --sources claude,codex "
+            "--reprocess-sessions")
+        return
+    totals = roi["totals"]
+    per_commit = (f"${totals['usd_per_commit']:,.2f} per shipped commit"
+                  if totals["usd_per_commit"] is not None else "no commits")
+    say(f"  total AI spend: {C_BOLD}${totals['spend_usd']:,.0f}{C_RESET}   "
+        f"commits: {totals['commits']:,}   {per_commit}")
+    say(f"  unconverted spend: ${totals['unconverted_spend_usd']:,.0f} "
+        f"({totals['unconverted_pct']}%) — sessions with no commit in the "
+        f"project within {roi['window_days']} days")
+    if sp["subscription_roi_multiple"]:
+        say(f"  subscription ROI: {C_BOLD}{sp['subscription_roi_multiple']}x{C_RESET} "
+            f"(${sp['monthly_value_usd']:,.0f}/mo value ÷ "
+            f"${sp['subscription_usd_month']:,.0f}/mo price)")
+    else:
+        say(f"  {C_DIM}set your subscription price for the ROI multiple: "
+            f"roi --set-subscription 200{C_RESET}")
+    say("")
+    say(f"  {C_BOLD}by tool{C_RESET}")
+    say(f"  {'tool':<8} {'spend':>10} {'sessions':>9} {'converted':>10} "
+        f"{'unconverted':>12}")
+    for source, e in roi["by_source"].items():
+        say(f"  {source:<8} {'$' + format(e['spend_usd'], ',.0f'):>10} "
+            f"{e['sessions_with_spend']:>9} {str(e['conversion_pct']) + '%':>10} "
+            f"{'$' + format(e['unconverted_spend_usd'], ',.0f'):>12}")
+    say("")
+    say(f"  {C_BOLD}by model{C_RESET}")
+    for model, usd in list(sp["by_model"].items())[:8]:
+        say(f"  {model:<28} {'$' + format(usd, ',.0f'):>10}")
+    say("")
+    say(f"  {C_BOLD}by month{C_RESET}")
+    say(f"  {'month':<8} {'spend':>10} {'commits':>8} {'$/commit':>10}")
+    for month, e in list(roi["by_month"].items())[-12:]:
+        pc = f"${e['usd_per_commit']:,.2f}" if e["usd_per_commit"] is not None else "—"
+        say(f"  {month:<8} {'$' + format(e['spend_usd'], ',.0f'):>10} "
+            f"{e['commits']:>8} {pc:>10}")
+    say("")
+    say(f"  {C_BOLD}by project{C_RESET} (top by spend)")
+    say(f"  {'project':<28} {'spend':>10} {'commits':>8} {'$/commit':>10}")
+    for project, e in roi["by_project"].items():
+        pc = f"${e['usd_per_commit']:,.2f}" if e["usd_per_commit"] is not None else "—"
+        say(f"  {project[:28]:<28} {'$' + format(e['spend_usd'], ',.0f'):>10} "
+            f"{e['commits']:>8} {pc:>10}")
+    gaps = [source for source, c in sp["coverage"].items() if not c["with_tokens"]]
+    if gaps:
+        say(f"  {C_DIM}no token data available from: {', '.join(gaps)} "
+            f"(not inferred){C_RESET}")
+
+
+def cmd_today(args) -> None:
+    db = open_db(args.db)
+    s = summarize(db)
+    daily = s["_daily"]
+    allocation = allocate_coding_hours(
+        sum(per.get("own", 0.0) for per in daily["attributed"].values()),
+        sum(per.get("coauthored", 0.0) for per in daily["attributed"].values()),
+        sum(per.get("ai_only", 0.0) for per in daily["attributed"].values()))
+
+    def day_stats(day: str) -> dict:
+        evidence = daily["attributed"].get(day, {})
+        shared = evidence.get("coauthored", 0.0)
+        return {
+            "yours": evidence.get("own", 0.0) + shared * allocation["your_share"]
+            + evidence.get("uncaptured", 0.0),
+            "ai": evidence.get("ai_only", 0.0) + shared * allocation["ai_share"],
+            "screen": daily["screen"].get(day, 0.0),
+            "spend": daily["spend"]["by_day"].get(day, 0.0),
+            "commits": daily["commits"].get(day, 0),
+        }
+
+    today = datetime.now().astimezone().strftime("%Y-%m-%d")
+    week_days = [(datetime.now().astimezone() - timedelta(days=offset))
+                 .strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+    t = day_stats(today)
+    say(f"{C_BOLD}today{C_RESET}  {today}")
+    say(f"  yours {fmt_h(t['yours'])} · AI {fmt_h(t['ai'])} · "
+        f"screen {fmt_h(t['screen'])} · AI spend ${t['spend']:,.0f} · "
+        f"commits {t['commits']}")
+    week = [day_stats(day) for day in week_days]
+    active = sum(1 for day in week_days if day in set(s['_daily']['evidence_days']))
+    say(f"{C_BOLD}week{C_RESET}   {week_days[0]} → {week_days[-1]}")
+    say(f"  yours {fmt_h(sum(w['yours'] for w in week))} · "
+        f"AI {fmt_h(sum(w['ai'] for w in week))} · "
+        f"screen {fmt_h(sum(w['screen'] for w in week))} · "
+        f"AI spend ${sum(w['spend'] for w in week):,.0f} · "
+        f"commits {sum(w['commits'] for w in week)} · "
+        f"active {active}/7")
+    say(f"  streak: {s['current_streak']}d (best {s['best_streak']}d)")
+
+
 def cmd_report(args) -> None:
     db = open_db(args.db)
     s = summarize(db)
@@ -2394,6 +2612,9 @@ def cmd_report(args) -> None:
     if s["remote_commits"]:
         L.append(f"- Remote-only GitHub commits: **{s['remote_commits']:,}** "
                  f"(+{s['github_loc_added']:,} LOC)")
+    if s["ai_spend"]["available"]:
+        L.append(f"- AI spend, API-equivalent: **${s['ai_spend']['total_usd']:,.0f}** "
+                 f"(what the tokens would cost at list prices, not what you paid)")
     L.append(f"- AI-assisted sessions: **{s['sessions']:,}**")
     L.append(f"- AI leverage: **{s['analytics']['ai_leverage_pct']}%** of attributed time")
     L.append(f"- Active days: **{s['active_days']:,}** — current streak "
@@ -2433,6 +2654,47 @@ def cmd_report(args) -> None:
         L.append("|-----|------:|")
         for bundle, hours_total in st["per_app_hours"].items():
             L.append(f"| {bundle} | {hours_total:,} |")
+    sp, roi = s["ai_spend"], s["roi"]
+    if sp["available"]:
+        totals = roi["totals"]
+        L.append("\n## AI ROI\n")
+        L.append(f"*{roi['label']}.*\n")
+        per_commit = (f"**${totals['usd_per_commit']:,.2f}** per shipped commit"
+                      if totals["usd_per_commit"] is not None else "no commits")
+        L.append(f"- Total AI spend: **${totals['spend_usd']:,.0f}** across "
+                 f"{totals['commits']:,} local commits — {per_commit}")
+        L.append(f"- Unconverted spend: **${totals['unconverted_spend_usd']:,.0f} "
+                 f"({totals['unconverted_pct']}%)** — sessions with no commit in "
+                 f"the project within {roi['window_days']} days")
+        if sp["subscription_roi_multiple"]:
+            L.append(f"- Subscription ROI: **{sp['subscription_roi_multiple']}x** "
+                     f"(${sp['monthly_value_usd']:,.0f}/mo API-equivalent value ÷ "
+                     f"${sp['subscription_usd_month']:,.0f}/mo subscription)")
+        L.append("")
+        L.append("| Tool | Spend | Sessions | Conversion | Unconverted |")
+        L.append("|------|------:|---------:|-----------:|------------:|")
+        for source, e in roi["by_source"].items():
+            L.append(f"| {source} | ${e['spend_usd']:,.0f} | "
+                     f"{e['sessions_with_spend']:,} | {e['conversion_pct']}% | "
+                     f"${e['unconverted_spend_usd']:,.0f} |")
+        L.append("")
+        L.append("| Month | Spend | Commits | $/commit |")
+        L.append("|-------|------:|--------:|---------:|")
+        for month, e in list(roi["by_month"].items())[-12:]:
+            pc = (f"${e['usd_per_commit']:,.2f}"
+                  if e["usd_per_commit"] is not None else "—")
+            L.append(f"| {month} | ${e['spend_usd']:,.0f} | "
+                     f"{e['commits']:,} | {pc} |")
+        L.append("")
+        L.append("| Model | Spend |")
+        L.append("|-------|------:|")
+        for model, usd in list(sp["by_model"].items())[:10]:
+            L.append(f"| {model} | ${usd:,.0f} |")
+        gaps = [source for source, c in sp["coverage"].items()
+                if not c["with_tokens"]]
+        if gaps:
+            L.append(f"\nNo token data available from: {', '.join(gaps)} "
+                     f"(shown as coverage gaps, never inferred).")
     L.append("\n## Hours by year\n")
     L.append("| Year | Hours |")
     L.append("|------|------:|")
@@ -3246,6 +3508,14 @@ def main() -> None:
 
     p = sub.add_parser("status", help="quick terminal summary")
     p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("roi", help="AI spend tied to shipped outcomes")
+    p.add_argument("--set-subscription", type=float, metavar="USD",
+                   help="store your monthly subscription price for the ROI multiple")
+    p.set_defaults(fn=cmd_roi)
+
+    p = sub.add_parser("today", help="today and this week at a glance")
+    p.set_defaults(fn=cmd_today)
 
     p = sub.add_parser("report", help="full report")
     p.add_argument("--format", choices=["markdown", "json"], default="markdown")
