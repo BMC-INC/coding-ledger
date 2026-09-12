@@ -14,3 +14,9 @@ build/
 CLAUDE.md
 IRONMEM.md
 license_signing_key
+
+# Private agent state and local handoffs must stay out of public source.
+IRONMEM.md
+HANDOFF*.md
+*_HANDOFF*.md
+.DS_Store
