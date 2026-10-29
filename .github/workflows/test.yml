@@ -28,6 +28,7 @@ jobs:
           python -m pip wheel . --no-deps --wheel-dir dist
           python -m venv "$RUNNER_TEMP/ledger-install"
           "$RUNNER_TEMP/ledger-install/bin/python" -m pip install --no-deps dist/*.whl
+          python scripts/smoke-installed.py "$RUNNER_TEMP/ledger-install/bin/coding-ledger"
           cd "$RUNNER_TEMP"
           "$RUNNER_TEMP/ledger-install/bin/coding-ledger" --help
           "$RUNNER_TEMP/ledger-install/bin/python" -c 'import coding_ledger; tag = coding_ledger.chartjs_tag(); assert "Chart.js" in tag; assert "<script src=" not in tag'

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "coding-ledger"
-version = "1.0.0"
+version = "1.0.1"
 description = "Local-first record of your coding work: hours, attribution, and AI ROI from receipts. Zero dependencies."
 readme = "README.md"
 requires-python = ">=3.10"

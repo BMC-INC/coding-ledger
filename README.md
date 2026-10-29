@@ -18,8 +18,7 @@ builders who want a work record without uploading prompts or source code.
 - Add macOS Screen Time evidence to account for work that produces no commit.
 
 The scanner uses Python 3.10+ and the standard library. Chart.js is bundled with
-the application for offline dashboards; no browser CDN is needed by the current
-source build. PDF and image export requires Chrome, Chromium, or Edge.
+the application for offline dashboards; no browser CDN is needed by version 1.0.1 and later. PDF and image export requires Chrome, Chromium, or Edge.
 
 ## Project status
 
@@ -29,9 +28,9 @@ attribution, pricing, and reporting. macOS is the primary environment; Screen Ti
 and the scheduled scan are macOS-specific. Hosted accounts and team administration
 are outside the current product.
 
-The latest published release is **v1.0.0**. The main branch includes subsequent
-source-import and packaging improvements. Use the source installation below to
-get those improvements; PyPI and Homebrew installations follow the published release.
+Version **1.0.1** includes source-import and offline packaging improvements.
+Download the wheel or source archive from [GitHub Releases](https://github.com/BMC-INC/coding-ledger/releases).
+Check the version offered by PyPI or Homebrew when choosing an installation channel.
 
 This project is **source-available under Elastic License 2.0**, not OSI open source.
 The scanner and reports are free; selected dashboard views and the ROI share card
@@ -57,11 +56,17 @@ coding-ledger today
 coding-ledger dashboard --open
 ```
 
-To use the release instead, install with `pipx install coding-ledger`,
-`uv tool install coding-ledger`, or follow the
+To install the validated GitHub release directly:
+
+```bash
+python -m pip install https://github.com/BMC-INC/coding-ledger/releases/download/v1.0.1/coding_ledger-1.0.1-py3-none-any.whl
+```
+
+PyPI installation (`pipx install coding-ledger` or `uv tool install coding-ledger`)
+may lag the GitHub release until its separate publication completes. You can also follow the
 [Homebrew tap](https://github.com/BMC-INC/homebrew-coding-ledger).
-The published v1.0.0 Python wheel does not bundle the dashboard chart asset;
-source installation above includes the offline packaging fix.
+The older v1.0.0 Python wheel omits the dashboard chart asset. Upgrade to 1.0.1
+or install the 1.0.1 wheel from GitHub Releases for fully offline charts.
 
 Run `coding-ledger doctor` to see which sources are discoverable.
 Use `coding-ledger --help` or `coding-ledger scan --help` for options.
@@ -120,3 +125,5 @@ example using synthetic data, and the checks you ran. Do not attach real assista
 logs or your personal ledger to public issues.
 
 Built by [ExecLayer / BMC-INC](https://github.com/BMC-INC).
+
+Release maintainers: see [the release procedure](docs/releasing.md).
