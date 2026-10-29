@@ -40,6 +40,7 @@ import bisect
 import fnmatch
 import hashlib
 import html
+from importlib import resources
 import json
 import os
 import re
@@ -3208,19 +3209,10 @@ def cmd_uninstall_daemon(args) -> None:
 
 # ---------------------------------------------------------------- dashboard
 
-CHARTJS_VERSION = "4.5.1"
-CHARTJS_SRI = "sha384-jb8JQMbMoBUzgWatfe6COACi2ljcDdZQ2OxczGA3bGNeWe+6DChMTBJemed7ZnvJ"
-
-
 def chartjs_tag() -> str:
-    """Inline the vendored Chart.js (fully offline dashboard); SRI-pinned CDN fallback."""
-    vendored = Path(__file__).resolve().parent / "vendor" / "chart.umd.min.js"
-    if vendored.is_file():
-        return f"<script>{vendored.read_text(errors='replace')}</script>"
-    warn("vendor/chart.umd.min.js missing — dashboard will use the CDN (SRI-pinned)")
-    return (f'<script src="https://cdn.jsdelivr.net/npm/chart.js@{CHARTJS_VERSION}'
-            f'/dist/chart.umd.min.js" integrity="{CHARTJS_SRI}" '
-            f'crossorigin="anonymous"></script>')
+    """Inline the bundled Chart.js without making the report depend on a CDN."""
+    asset = resources.files("coding_ledger_assets").joinpath("chart.umd.min.js")
+    return f"<script>{asset.read_text(encoding='utf-8')}</script>"
 
 
 def _render_dashboard_legacy(s: dict, daily: dict) -> str:

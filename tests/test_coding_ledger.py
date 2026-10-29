@@ -36,6 +36,12 @@ class LedgerTestCase(unittest.TestCase):
         self.db.close()
         self.temp.cleanup()
 
+    def test_dashboard_bundles_chartjs_without_remote_script(self):
+        tag = ledger.chartjs_tag()
+        self.assertTrue(tag.startswith("<script>"))
+        self.assertIn("Chart.js", tag)
+        self.assertNotIn("<script src=", tag)
+
     def test_schema_migrates_scan_status(self):
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(scans)")}
         self.assertIn("status", columns)
