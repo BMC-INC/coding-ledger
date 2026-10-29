@@ -23,3 +23,11 @@ jobs:
         run: python -m py_compile coding_ledger.py tests/test_coding_ledger.py
       - name: Test
         run: python -m unittest discover -s tests -v
+      - name: Build and verify installed offline assets
+        run: |
+          python -m pip wheel . --no-deps --wheel-dir dist
+          python -m venv "$RUNNER_TEMP/ledger-install"
+          "$RUNNER_TEMP/ledger-install/bin/python" -m pip install --no-deps dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/ledger-install/bin/coding-ledger" --help
+          "$RUNNER_TEMP/ledger-install/bin/python" -c 'import coding_ledger; tag = coding_ledger.chartjs_tag(); assert "Chart.js" in tag; assert "<script src=" not in tag'

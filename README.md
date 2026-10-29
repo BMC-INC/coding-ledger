@@ -1,341 +1,122 @@
 # Coding Ledger
 
-**Know what your AI actually returns.**
+**Understand the cost and outcomes of AI-assisted development from the records already on your machine.**
 
-By ExecLayer Inc. Source-available under the [Elastic License 2.0](LICENSE):
-free to use and modify, not OSI open source.
+Coding Ledger connects Git history with local coding-assistant activity to produce
+an offline dashboard of token usage, API-equivalent cost, time estimates, and
+session-to-commit outcomes. It is built for individual developers and independent
+builders who want a work record without uploading prompts or source code.
 
-Coding Ledger reads the receipts already on your machine — Git history, Claude
-Code and Codex session logs, editor activity, macOS Screen Time — and turns
-them into an evidence-backed answer to three questions no other tool answers
-together:
+[Getting started](#getting-started) · [Reference](docs/reference.md) · [Releases](https://github.com/BMC-INC/coding-ledger/releases) · [Report an issue](https://github.com/BMC-INC/coding-ledger/issues)
 
-1. **How much did your AI work cost?** Token usage from local agent logs,
-   priced at API list rates ("API-equivalent value" — what it would have cost,
-   not what you paid on a subscription).
-2. **What did it return?** Spend tied to shipped commits and merged PRs:
-   cost per shipped commit, conversion rate per tool, unconverted spend,
-   monthly trends, and your subscription ROI multiple.
-3. **How do you actually work?** Human-versus-AI attribution, total involved
-   time verified against Screen Time, streaks, badges, and a shareable
-   builder field report.
+## What you can do
 
-Everything runs locally. No prompts, source code, secrets, or tool output are
-ever stored. It is a single Python 3.10+ standard-library application with
-zero dependencies; the generated dashboard is self-contained and works
-offline.
+- Compare AI usage with commits and, optionally, merged GitHub pull requests.
+- Review daily activity, project trends, attribution, and gaps in source coverage.
+- Keep a local SQLite ledger with repeatable, resumable scans.
+- Generate a self-contained HTML dashboard and shareable aggregate reports.
+- Add macOS Screen Time evidence to account for work that produces no commit.
 
-## Quick start
+The scanner uses Python 3.10+ and the standard library. Chart.js is bundled with
+the application for offline dashboards; no browser CDN is needed by the current
+source build. PDF and image export requires Chrome, Chromium, or Edge.
+
+## Project status
+
+The CLI, scanner, dashboard, reports, and offline license verification are
+implemented. Automated tests cover source parsing, privacy exclusions, deduplication,
+attribution, pricing, and reporting. macOS is the primary environment; Screen Time
+and the scheduled scan are macOS-specific. Hosted accounts and team administration
+are outside the current product.
+
+The latest published release is **v1.0.0**. The main branch includes subsequent
+source-import and packaging improvements. Use the source installation below to
+get those improvements; PyPI and Homebrew installations follow the published release.
+
+This project is **source-available under Elastic License 2.0**, not OSI open source.
+The scanner and reports are free; selected dashboard views and the ROI share card
+require an offline Pro license. See [Free versus Pro](docs/reference.md#free-versus-pro)
+and the [license](LICENSE).
+
+## Getting started
+
+Requirements: Python 3.10+, Git, and local repositories or supported assistant logs.
+Start with an explicit project folder so the scan covers the work you intend to measure.
 
 ```bash
-pipx install coding-ledger        # or: uvx coding-ledger
-# or: brew tap BMC-INC/coding-ledger && brew install coding-ledger
-# from a clone, python3 coding_ledger.py works identically
+git clone https://github.com/BMC-INC/coding-ledger.git
+cd coding-ledger
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install .
 
 coding-ledger init --author "Your Name,you@example.com"
-coding-ledger scan --roots "$HOME/Projects"
-coding-ledger roi                 # AI spend tied to shipped outcomes
-coding-ledger today               # today and this week at a glance
+coding-ledger scan --roots "$HOME/Projects" --sources git,claude,codex
+coding-ledger roi
+coding-ledger today
 coding-ledger dashboard --open
 ```
 
-## AI ROI
-
-The `roi` command and the dashboard's AI ROI section tie token spend to
-shipped outcomes:
-
-- Token usage is read from local Claude Code and Codex logs (Grok when its
-  logs carry usage). Sources without usage fields (Gemini, Cursor, Aider,
-  VS Code, Antigravity) are shown as coverage gaps, never inferred.
-- Dollar figures are **API-equivalent value at list prices**. The embedded
-  pricing table is overridable at `~/.coding-ledger/pricing.json`
-  (`{"model-pattern": {"input": .., "output": .., "cache_read": ..,
-  "cache_write": ..}}` in USD per million tokens). Unknown models are
-  labeled unpriced, never guessed.
-- `roi --set-subscription 200` stores your monthly subscription price and
-  unlocks the headline multiple: monthly API-equivalent value ÷ price.
-- `scan --gh-prs` also records merged authored PRs via `gh` (repo, number,
-  timestamps only) as zero-hour outcome evidence.
-- Backfill after upgrading:
-  `scan --sources claude,codex --reprocess-sessions`.
-
-## Free versus Pro
-
-Free: all scanning, the SQLite ledger, status, `roi`, `today`, full
-JSON/markdown reports, headline dashboard ROI totals, and the existing public
-scorecard exports.
-
-Pro (offline license, no phone-home): the dashboard ROI deep-dive (per-tool
-conversion, per-model and per-project breakdowns, monthly trend chart,
-unconverted-spend view) and the 1200×1350 AI ROI share card export.
-
-Buy Pro:
-
-- [$49 per year](https://buy.stripe.com/4gMeVd3PA3Oc3Ut0eQ6c000)
-- [$99 early lifetime](https://buy.stripe.com/7sY7sLeue70o9eNe5G6c001)
-
-Your license key is emailed after purchase. Then:
-
-```bash
-coding-ledger license install <file-or-string>
-coding-ledger license status
-```
-
-The license is an Ed25519-signed blob verified against a key embedded in the
-script. Gating is honor-based and rendering-only.
-
-## Sources
-
-| Source | Receipt | Hours |
-|---|---|---:|
-| Git | Author-filtered commits, SHA, timestamp, numstat, co-author trailers | Daily density proxy |
-| Claude Code | `~/.claude/projects/**/*.jsonl` metadata | Sessionized active time |
-| Codex | `~/.codex/sessions/**/*.jsonl` metadata | Sessionized and attributed time |
-| Gemini | `~/.gemini/tmp/*/chats/session-*.json[l]` metadata | Sessionized and attributed time |
-| Antigravity | Local edit history plus opaque trajectory counts | Capped edit proxy |
-| Grok Build | `$GROK_HOME/sessions/**/events.jsonl` metadata | Sessionized and attributed time |
-| Cursor | Agent transcripts, chat timestamps, local history | Sessionized active time |
-| Aider | `.aider.chat.history.md` timestamps | Sessionized active time |
-| VS Code | Local History edit timestamps | Capped edit proxy |
-| GitHub | Contributor-week commits and LOC for remote-only repositories | Zero hours |
-| Screen Time | macOS per-app foreground intervals (bundle ids and durations only) | Envelope, never additive |
-
-Git commits are deduplicated by SHA. Growing agent sessions are replaced by stable,
-path-based event IDs, making rescans idempotent.
-
-Do not include iCloud-backed Desktop repositories in scan roots. Explicit roots are
-enforced even when the database contains older cached Desktop paths.
-
-## Lightweight GitHub history
-
-Working trees are unnecessary for exact Git history. Create or update no-checkout
-repositories on non-iCloud storage:
-
-```bash
-python3 coding_ledger.py sync-github \
-  --owners "BMC-INC" \
-  --destination "/Volumes/MacBook Extended Storage/Coding-Ledger-GitHub"
-```
-
-These repositories contain Git objects and refs but omit working-tree build artifacts
-such as `node_modules` and Rust `target`. Add the destination to `--roots`; the normal
-Git scanner then records exact commit SHAs and numstat.
-
-The GitHub aggregate source remains a fallback for repositories not represented by
-a local or no-checkout repository:
-
-```bash
-python3 coding_ledger.py scan \
-  --sources github \
-  --gh-owners "BMC-INC" \
-  --gh-login "YOUR_GITHUB_LOGIN"
-```
-
-GitHub aggregates receive zero hours and are skipped for projects already represented
-by exact local Git receipts.
-
-## Hours and attribution
-
-Coding Ledger reports two totals:
-
-- **Raw source sum** preserves every source's independent hours.
-- **Attributed total** discounts only timestamp-qualified shared agent activity
-  against human Git/editor proxies. Independently running AI time remains additive.
-
-The attributed total has two scorecard categories:
-
-- **Your Coding:** measured human-only base hours plus your proportional share of
-  shared work.
-- **AI Coding:** measured AI-only base hours plus AI's proportional share of shared
-  work.
-
-Shared work is agent activity within ten minutes of an explicit human steering turn.
-It is split using the ratio of human-only to AI-only base hours. For example, if the
-base evidence is 100 human hours and 50 AI hours, two-thirds of shared hours go to
-Your Coding and one-third goes to AI Coding. Explicit Git `Co-authored-by` trailers
-remain supporting evidence for badges, not a third scorecard category.
-
-For each day, credited time is:
-
-```text
-max(human Git/editor evidence, timestamp-qualified shared AI time)
-+ independent AI time
-```
-
-Agent sources without sufficient steering metadata default their full duration to
-shared work. This preserves a conservative fallback without treating all AI work on
-the same calendar day as concurrent.
-
-These are evidence-based estimates, not claims about who typed each line. The JSON
-report exposes the raw totals, attributed totals, source breakdown, and underlying
-badge metrics.
-
-Current time heuristics:
-
-- Agent sources: timestamps split at 30-minute idle gaps with a one-minute floor.
-- Git: `0.35h + 0.10h × commits` per active day, capped at six hours.
-- VS Code: two minutes per history edit, capped at 90 minutes per day.
-- GitHub: commits and LOC only; zero hours.
-- Screen Time: measured foreground intervals, capped at 18 hours per day.
-
-## Total involved time (screen-verified)
-
-Receipts alone miss the reading, reviewing, and debugging time that never
-produces a commit or an agent session. The `screen` source reads macOS Screen
-Time foreground intervals for an allowlist of coding apps (terminals, editors,
-IDEs, agent desktop apps; browsers excluded by default) and persists them into
-the ledger before Apple's roughly four-week retention prunes them. Override the
-allowlist at `~/.coding-ledger/screen_apps.json` with `include`/`exclude`
-fnmatch pattern lists; edits re-filter all persisted history.
-
-Screen time overlaps git, editor, and steering evidence, so it is an envelope,
-never an additive source. The explicit per-day formula:
-
-```text
-screen_hours   = allowlisted foreground seconds / 3600 (18h/day cap)
-uncaptured     = max(0, screen_hours - max(human_evidence, shared_ai))
-total_involved = max(human_evidence, shared_ai, screen_hours) + independent_ai
-               = attributed_total + uncaptured
-```
-
-`uncaptured` is coding-app time with no receipt. It credits to Your Coding,
-never to AI Coding, and is always reported as its own labeled line. The raw
-source sum and the attributed total are unchanged; total involved time is a
-third explicit total. A day needs at least 15 minutes of coding-app screen
-time to count as an active day on its own. If the store is unreadable (Full
-Disk Access not granted to the scanning context), the scan records a warning
-and totals fall back to attributed-only; the gap is labeled, never inferred.
-
-## Workflow analytics
-
-Coding Ledger exposes reproducible analytics instead of an opaque productivity score:
-
-- AI leverage as a share of attributed coding time
-- project focus and neutral portfolio-diversity measurement
-- multi-project versus single-project commit and active-hour comparisons
-- alternating building/off-day runs, all-time totals, and longest break
-- verification calls per AI session
-- parallel-agent dispatches
-- session-to-commit conversion within a visible seven-day window
-- median session-to-commit lag for project-matchable receipts
-
-Activity is measured. Performance is evidenced through outcomes such as commits,
-tests, and sustained delivery. The tool does not claim that hours alone establish
-quality or business impact. Project diversity is not scored as inherently good or
-bad; the accompanying cohort comparison shows whether broader workdays coincide
-with stronger or weaker momentum for that builder. Cohorts are assigned from
-session and editor receipts, while commits are measured separately as the outcome.
-
-## Builder profile and badges
-
-The dashboard is an offline builder field report with five reproducible dimensions:
-
-- Steering
-- Planning
-- Engineering
-- Execution
-- Autonomy
-
-The highest dimension selects an archetype such as The Architect, The Director,
-The Quality Guardian, The Shipping Engine, or The Agent Orchestrator.
-
-Badges have visible Bronze, Silver, Gold, and Platinum thresholds:
-
-- Commit Cadence
-- Quality Loop
-- Steering Hand
-- Toolsmith
-- Parallel Commander
-- Night Shift
-- AI Pairing
-
-Every badge shows its measured value and next threshold. No model-generated personality
-judgment is stored or required.
-
-## Privacy
-
-For agent sessions, Coding Ledger reads only:
-
-- timestamps and record types
-- session identifier and working directory
-- role counts
-- tool-call counts
-- locally derived test, planning, and parallel-agent counts
-
-It does **not** store:
-
-- prompts or assistant responses
-- reasoning text
-- tool arguments or output
-- source code
-- environment variables, credentials, or API keys
-
-The database stores minimal provenance: source path, project identifier, day buckets,
-active seconds, attribution seconds, and aggregate counts.
-
-For Screen Time, Coding Ledger reads only app bundle identifiers and interval
-durations. It never reads window titles, document names, or URLs.
-
-## Public exports
-
-Generate a public-safe scorecard, one-page PDF, and LinkedIn image locally:
-
-```bash
-python3 coding_ledger.py export --name "Your Name"
-```
-
-Exports are written to `~/.coding-ledger/share/` by default. The PDF contains
-selectable text and the social image is 1200×1350 pixels. Both omit prompts,
-responses, source code, secrets, tool output, project names, and repository names.
-They report only aggregate evidence, including the number of repositories with
-matched commits. Chrome, Chromium, or Edge is required for rendering.
-
-## Scan durability
-
-A scan row is written before processing starts. It is updated after every source and
-ends as `running`, `complete`, or `interrupted`.
-
-`status` explicitly labels the ledger provisional when no completed scan exists.
-Per-repository and per-session commits preserve already imported events after an
-interruption. Git timeouts are recorded with exact repository paths.
-
-Use `scan --sources claude,codex,gemini,grok --reprocess-sessions` after changing attribution
-rules; it invalidates only the selected source caches and upserts the same stable events.
-
-## License and direction
-
-Coding Ledger is source-available, not open source. The code is licensed under
-the [Elastic License 2.0](LICENSE), copyright ExecLayer Inc.: use it, read it,
-and modify it freely; you may not offer it as a hosted service, circumvent or
-remove the Pro license gating, or strip the licensing notices.
-
-The scanner, SQLite ledger, reports, analytics, and generated local site are free
-and unlocked; the Pro license gates only the dashboard ROI deep-dive and the ROI share
-card (see Free versus Pro above). The product thesis is the individual builder's
-work record in the AI era: prove how you build, and what your AI returns, without
-exposing what you build. Hosted verification and team features are intentionally
-deferred until real usage establishes which workflows users value.
-
-## Commands
-
-```text
-init              Initialize metadata and author identities
-scan              Scan selected sources and explicit roots (--gh-prs for PRs)
-status            Show terminal totals, attribution, spend, and scan state
-roi               AI spend tied to shipped outcomes (--set-subscription USD)
-today             Today and this week at a glance
-report            Produce Markdown or JSON
-dashboard         Generate the offline landing page and HTML field report
-export            Generate public-safe HTML, PDF, LinkedIn image, ROI card
-license           Install or inspect the Pro license
-doctor            Show discoverable sources, including Codex
-sync-github       Maintain lightweight no-checkout GitHub history
-install-daemon    Install the macOS daily scan
-uninstall-daemon  Remove the daily scan
-```
-
-Run tests with:
+To use the release instead, install with `pipx install coding-ledger`,
+`uv tool install coding-ledger`, or follow the
+[Homebrew tap](https://github.com/BMC-INC/homebrew-coding-ledger).
+The published v1.0.0 Python wheel does not bundle the dashboard chart asset;
+source installation above includes the offline packaging fix.
+
+Run `coding-ledger doctor` to see which sources are discoverable.
+Use `coding-ledger --help` or `coding-ledger scan --help` for options.
+Data is stored in `~/.coding-ledger/`; set `CODING_LEDGER_DIR` to choose another location.
+
+## Supported evidence
+
+| Source | What it contributes |
+| --- | --- |
+| Git | Author-filtered commits, changed-line counts, and commit timestamps |
+| Claude Code and Codex | Local session metadata and token usage when present |
+| Gemini, Grok Build, Cursor, Aider, VS Code, Antigravity | Available session or editor metadata; coverage varies by source |
+| GitHub (optional) | Merged PRs and aggregate history through your authenticated `gh` CLI |
+| macOS Screen Time (optional) | Allowlisted coding-app foreground intervals |
+
+Rescans deduplicate commit and session evidence. Interrupted scans retain imported
+records and display their incomplete state. The
+[reference](docs/reference.md#sources) describes source paths and attribution rules.
+
+## How to read the numbers
+
+**API-equivalent cost is an estimate, not your invoice.** Token counts are priced
+with the configured per-model rates. Unknown models remain unpriced; sources
+without usage fields remain coverage gaps. Update `~/.coding-ledger/pricing.json`
+when rates or models change.
+
+**Time and outcome attribution are heuristics.** Session timestamps, commit-density
+proxies, and editor activity cannot prove who typed each line or whether work was
+valuable. Session-to-commit matching uses a visible seven-day window. A subscription
+multiple compares API-equivalent value with the price you enter; it is not measured
+profit or business ROI.
+
+## Privacy and network use
+
+Scanning and reporting run locally. The ledger stores timestamps, source paths,
+project identifiers, and aggregate counts. It does not persist prompt or response
+text, source code, tool arguments, tool output, or credentials. Treat the database
+and detailed dashboard as private because they identify projects and local paths.
+
+Optional GitHub commands contact GitHub through `gh`. Installing packages and
+opening purchase links also requires a network connection. Local dashboard viewing
+and offline license verification do not require a service account or telemetry.
+The [public export command](docs/reference.md#public-exports) omits project and
+repository names; review any artifact before sharing it.
+
+## Development
 
 ```bash
 python3 -m unittest discover -s tests -v
+python3 -m pip wheel . --no-deps --wheel-dir dist
 ```
+
+CI runs the tests on Python 3.10 and 3.14 and checks that an installed wheel contains
+the offline chart asset. For a contribution, include the problem, a reproducible
+example using synthetic data, and the checks you ran. Do not attach real assistant
+logs or your personal ledger to public issues.
+
+Built by [ExecLayer / BMC-INC](https://github.com/BMC-INC).

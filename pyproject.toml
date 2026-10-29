@@ -27,3 +27,7 @@ Homepage = "https://github.com/BMC-INC/coding-ledger"
 
 [tool.setuptools]
 py-modules = ["coding_ledger"]
+packages = ["coding_ledger_assets"]
+
+[tool.setuptools.package-data]
+coding_ledger_assets = ["*.js"]
